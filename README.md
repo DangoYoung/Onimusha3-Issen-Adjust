@@ -12,12 +12,12 @@
 ## 安装与卸载
 
 1. 退出游戏。确认游戏根目录已有支持 `InitializeASI` 的 32 位 ASI Loader，例如以 `dinput8.dll` 安装的 [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)。
-2. 在文件页面用 **Download raw file** 下载需要的 `.asi`，放入游戏根目录下的 `scripts` 文件夹。使用补帧时，把 `Onimusha3.IssenWindow.ini` 放在同一目录。
+2. 在文件页面用 **Download raw file** 下载需要的 `.asi`，放入游戏根目录下的 `scripts` 文件夹。要启用补帧，把 `Onimusha3.IssenWindow.ini` 放在同一目录并按下面的说明设置。
 3. 卸载时先退出游戏，再把对应的 `.asi` 移出 `scripts`。
 
 ## 补帧设置
 
-打开 `scripts/Onimusha3.IssenWindow.ini`，修改 `[Issen]` 下的 `MinimumFrames`，然后重启游戏。仓库随附配置为 `3`，配置缺失或无效时使用 `5`。可设置 `2`–`255` 个动画帧，设为 `0` 或 `1` 时使用游戏原有的时机。
+打开 `scripts/Onimusha3.IssenWindow.ini`，修改 `[Issen]` 下的 `MinimumFrames`，然后重启游戏。默认值为 `0`，使用游戏原有的一闪时机。配置缺失或无效时也使用 `0`。设为 `2`–`255` 可启用补帧并指定最低动画帧数，例如 `3`。设为 `0` 或 `1` 可关闭补帧。
 
 ## 从源码编译
 

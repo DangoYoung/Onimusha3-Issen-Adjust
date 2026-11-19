@@ -178,7 +178,7 @@ namespace
     // 配置在插件初始化时读一次。玩家修改阈值后，重启游戏即可使用新值。
     unsigned ReadMinimumFrames()
     {
-        constexpr unsigned Default = 5;
+        constexpr unsigned Default = 0;
         wchar_t path[MAX_PATH];
         const DWORD length = GetModuleFileNameW(module, path, ARRAYSIZE(path));
         if (!length || length >= ARRAYSIZE(path))
@@ -192,9 +192,9 @@ namespace
         std::memcpy(extension, L".ini", sizeof(L".ini"));
 
         // 先按字符串读取 [Issen] 段中的 MinimumFrames，再按十进制检查全串。
-        // 空值、被截断的值和无效值都回退到默认 5。
+        // 配置缺失、为空、被截断或无效时使用默认值 0，保持原版时机。
         wchar_t value[16];
-        const DWORD chars = GetPrivateProfileStringW(L"Issen", L"MinimumFrames", L"5",
+        const DWORD chars = GetPrivateProfileStringW(L"Issen", L"MinimumFrames", L"",
                                                       value, ARRAYSIZE(value), path);
         if (!chars || chars >= ARRAYSIZE(value) - 1)
             return Default;
