@@ -56,7 +56,6 @@ namespace
     constexpr std::uintptr_t IssenWindowSite = 0x00818e89;
     constexpr std::uintptr_t BlendedMotionVtable = 0x0091ccf8;
     constexpr std::uintptr_t EnemyListCursor = 0x042398f0;
-    constexpr std::uintptr_t GameFlags = 0x0418a10c;
     constexpr std::uintptr_t SkipFrame = 0x031b9bfe;
     constexpr std::uintptr_t WidescreenProjectionSite = 0x00433bca;
     constexpr std::uintptr_t DeviceSettings = 0x04260a0c;
@@ -136,9 +135,8 @@ namespace
         const BYTE character = player[2];
         const BYTE state = player[8]; // Normal gameplay uses actor state 1.
 
-        // The original cue restricts this lookup to the playable characters.
-        if ((*reinterpret_cast<const DWORD*>(At(GameFlags)) & 0x1000) ||
-            character == 3 || character > 4 || state != 1 ||
+        // Practice uses the same player actor as the story.
+        if (character == 3 || character > 4 || state != 1 ||
             !Field<void*>(player, 0x30) || Field<int>(player, 0x21e8) < 0)
             return nullptr;
 
