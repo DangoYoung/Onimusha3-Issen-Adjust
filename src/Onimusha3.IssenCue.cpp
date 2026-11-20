@@ -176,9 +176,7 @@ namespace
             return false;
 
         float sample = static_cast<float>(current);
-        if (current == last)
-            sample = static_cast<float>(last + 1);
-        else if (blended)
+        if (blended)
         {
             // The source track stores eight fraction bits. Use them when the
             // source still agrees with the index copied into the shared fields.
@@ -219,11 +217,16 @@ namespace
         return {std::max(scan, std::min(first, earliest)), end};
     }
 
+    struct RingPosition
+    {
+        float frame;
+        unsigned lastWindowEnd;
+    };
+
     struct RingTiming
     {
-        float progress;
-        float opening;
-        float closing;
+        RingPosition position;
+        FrameWindow window;
         bool open;
     };
 
@@ -245,6 +248,7 @@ namespace
 
         FrameWindow selected{};
         int selectedOffset = 0;
+        unsigned lastWindowEnd = 0;
 
         while (window)
         {
@@ -255,6 +259,7 @@ namespace
                 next = NextWindow(frames, window.end, mask, minimum);
             }
 
+            lastWindowEnd = window.end;
             const int offset = OffsetFromWindow(frames.current, window);
             const bool selectWindow = nearestOffset
                 ? !selected || std::abs(offset) <= std::abs(selectedOffset)
@@ -267,14 +272,7 @@ namespace
             window = next;
         }
 
-        // Animation and window edges use the same linear radial scale.
-        const float count = static_cast<float>(frames.count);
-        timing = {
-            std::clamp(frames.sample / count, 0.0f, 1.0f),
-            static_cast<float>(selected.begin) / count,
-            static_cast<float>(selected.end) / count,
-            selectedOffset == 0,
-        };
+        timing = {{frames.sample, lastWindowEnd}, selected, selectedOffset == 0};
         if (nearestOffset)
             *nearestOffset = selectedOffset;
         return true;
@@ -339,8 +337,8 @@ namespace
     constexpr unsigned DashPeriod = 6;
     constexpr unsigned VisibleDashSteps = 4;
     constexpr float FullTurn = 6.28318530718f;
-    constexpr float MaxRadiusFraction = 0.122f;
-    constexpr float MinRadiusFraction = 0.014f;
+    constexpr float RadiusAtLastWindowEnd = 42.0f; // Pixels at 900p.
+    constexpr float RadiusPerFrame = 7.0f;
 
     struct UnitPoint { float x, y; };
     std::array<UnitPoint, CircleSteps> circle;
@@ -374,11 +372,13 @@ namespace
     constexpr auto StrokeIndices = MakeStrokeIndices<false>();
     constexpr auto DashedStrokeIndices = MakeStrokeIndices<true>();
 
-    float CueRadius(float height, float progress)
+    float RadiusAtFrame(float height, unsigned lastWindowEnd, float frame)
     {
-        const float outer = std::max(20.0f, height * MaxRadiusFraction);
-        const float inner = std::max(5.0f, height * MinRadiusFraction);
-        return outer - (outer - inner) * progress;
+        // Anchor the line at the final window's closing frame. Recovery
+        // remains visible until the radius reaches zero or this action ends.
+        const float scale = std::max(0.5f, height / 900.0f);
+        const float framesToClose = static_cast<float>(lastWindowEnd) - frame;
+        return scale * std::max(0.0f, RadiusAtLastWindowEnd + framesToClose * RadiusPerFrame);
     }
 
     struct Vertex { float x, y, z, rhw; D3DCOLOR color; };
@@ -424,10 +424,14 @@ namespace
     void DrawRing(IDirect3DDevice9* device, float x, float y, float radius,
                   float width, float halo, D3DCOLOR lineColor, D3DCOLOR haloColor, bool dashed = false)
     {
+        if (radius <= 0.0f)
+            return;
+
         const float outer = radius + width * 0.5f;
         const float inner = radius - width * 0.5f;
         const float radii[] = {outer + halo + 1.0f, outer + halo, outer,
-                               inner, inner - halo, inner - halo - 1.0f};
+                               std::max(0.0f, inner), std::max(0.0f, inner - halo),
+                               std::max(0.0f, inner - halo - 1.0f)};
         const auto transparent = haloColor & 0x00ffffff;
         const D3DCOLOR colors[] = {transparent, haloColor, lineColor, lineColor, haloColor, transparent};
         DrawRingMesh(device, x, y, radii, colors, dashed);
@@ -515,27 +519,30 @@ namespace
 
         void Draw(float x, float y, float height, const RingTiming& timing, bool accepted, unsigned opacity = 255)
         {
-            if (!state && !Begin())
+            const auto& position = timing.position;
+            const unsigned lastEnd = position.lastWindowEnd;
+            const float radius = RadiusAtFrame(height, lastEnd, position.frame);
+            if (radius <= 0.0f || (!state && !Begin()))
                 return;
 
             const float scale = std::max(0.75f, height / 900.0f);
-
-            DrawWindowBand(device, x, y, CueRadius(height, timing.opening),
-                           CueRadius(height, timing.closing), scale, accepted, opacity);
-            DrawRing(device, x, y, CueRadius(height, timing.progress), 2.15f * scale, 1.10f * scale,
+            DrawWindowBand(device, x, y, RadiusAtFrame(height, lastEnd, static_cast<float>(timing.window.begin)),
+                           RadiusAtFrame(height, lastEnd, static_cast<float>(timing.window.end)),
+                           scale, accepted, opacity);
+            DrawRing(device, x, y, radius, 2.15f * scale, 1.10f * scale,
                       ApplyOpacity(accepted ? 0xffffd05a : 0xf2fff3d5, opacity),
                       ApplyOpacity(accepted ? 0xdc9a4505 : 0xbc151319, opacity));
         }
 
         void DrawMiss(float x, float y, const D3DVIEWPORT9& viewport,
-                      float progress, int offset, unsigned opacity)
+                      const RingPosition& position, int offset, unsigned opacity)
         {
             if (!state && !Begin())
                 return;
 
             const float height = static_cast<float>(viewport.Height);
             const float scale = std::max(0.75f, height / 900.0f);
-            const float radius = CueRadius(height, progress);
+            const float radius = RadiusAtFrame(height, position.lastWindowEnd, position.frame);
             const auto color = ApplyOpacity(offset < 0 ? 0xff78e7fa : 0xffff967b, opacity);
             DrawRing(device, x, y, radius, 1.2f * scale, 0.65f * scale, color,
                      ApplyOpacity(0xd812191f, opacity), true);
@@ -607,7 +614,7 @@ namespace
     {
         const EnemyNode* node;
         const BYTE* actor;
-        float progress;
+        RingPosition position;
         int offset;
         ULONGLONG expires;
     };
@@ -645,7 +652,7 @@ namespace
         {
             const EnemyNode* node;
             std::uint32_t* activeFlags;
-            float progress;
+            RingPosition position;
             int offset;
         };
         std::array<Candidate, 32> candidates;
@@ -665,7 +672,7 @@ namespace
             auto* motion = Field<BYTE*>(enemy, 0x30);
             auto* activeFlags = reinterpret_cast<std::uint32_t*>(motion + 0xb4);
             if (!(*activeFlags & mask))
-                candidates[count++] = {node, activeFlags, timing.progress, offset};
+                candidates[count++] = {node, activeFlags, timing.position, offset};
         }
 
         if (!count)
@@ -686,7 +693,7 @@ namespace
             const auto& entry = candidates[index];
             if (entry.node->actor == candidate)
             {
-                missCue = {entry.node, candidate, entry.progress, entry.offset, GetTickCount64() + MissCueMs};
+                missCue = {entry.node, candidate, entry.position, entry.offset, GetTickCount64() + MissCueMs};
                 return;
             }
         }
@@ -717,18 +724,18 @@ namespace
         float x, y;
         const auto anchor = EnemyAnchor(node->actor);
         if (ProjectAnchor(anchor, viewport, x, y))
-            overlay.DrawMiss(x, y, viewport, missCue.progress, missCue.offset, opacity);
+            overlay.DrawMiss(x, y, viewport, missCue.position, missCue.offset, opacity);
     }
 
     struct HeldCue
     {
+        WorldPoint anchor;
+        ULONGLONG expires;
+        RingTiming timing;
         const EnemyNode* node;
         const BYTE* actor;
         const std::uint32_t* attackFlags;
-        unsigned lastFrame;
-        RingTiming timing;
-        WorldPoint anchor;
-        ULONGLONG expires;
+        std::uint16_t lastFrame;
         bool onOriginalAttack;
         bool seenAlive;
     };
@@ -780,7 +787,8 @@ namespace
                 return;
             cue = &*slot;
         }
-        *cue = {node, enemy, frames.flags, frames.current, timing, EnemyAnchor(enemy), 0, true, false};
+        *cue = {EnemyAnchor(enemy), 0, timing, node, enemy, frames.flags,
+                static_cast<std::uint16_t>(frames.current), true, false};
     }
 
     int __fastcall CommitWithCue(BYTE* player)
@@ -816,7 +824,7 @@ namespace
         // Idle and hit reactions leave the frozen radius intact. A restart
         // on the same animation table counts as a new attack when it wraps.
         cue->onOriginalAttack = sameAttack;
-        cue->lastFrame = frames.current;
+        cue->lastFrame = static_cast<std::uint16_t>(frames.current);
         cue->anchor = EnemyAnchor(node->actor);
         cue->seenAlive = true;
         return true;
