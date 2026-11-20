@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -29,6 +30,10 @@ namespace
     constexpr BYTE SelectorThunk[] = {0xe9, 0x09, 0x19, 0x41, 0};
     constexpr std::uintptr_t InputSelectCallSite = 0x0081a6b4;
     constexpr BYTE OriginalInputSelectCall[] = {0xe8, 0x69, 0xce, 0xbe, 0xff};
+    constexpr std::uintptr_t BindTargetCallSite = 0x0081a6c3;
+    constexpr BYTE OriginalBindTargetCall[] = {0xe8, 0xfc, 0xc7, 0xbe, 0xff};
+    constexpr std::uintptr_t NativeBindTarget = 0x00406ec4;
+    constexpr BYTE BindTargetThunk[] = {0xe9, 0x67, 0x72, 0x41, 0};
     constexpr std::uintptr_t CommitCallSite = 0x0081a6ce;
     constexpr BYTE OriginalCommitCall[] = {0xe8, 0x6f, 0xea, 0xbe, 0xff};
     constexpr std::uintptr_t IssenCommit = 0x00409142;
@@ -66,10 +71,12 @@ namespace
         bool direct = true;
         bool chain = true;
         bool directMiss = true;
+        bool directRejected = true;
         bool chainMiss = true;
         unsigned inputHoldMs = 2000;
 
         float innerRadius = 42.0f;
+        unsigned maxRadius = 300;
         float pixelsPerFrame = 7.0f;
         float ringWidth = 2.15f;
         float ringHalo = 1.10f;
@@ -85,6 +92,7 @@ namespace
         float missWidth = 1.2f;
         float missHalo = 0.65f;
         float labelPixelSize = 1.8f;
+        D3DCOLOR rejectedColor = 0xffffffff;
         D3DCOLOR earlyColor = 0xff78e7fa;
         D3DCOLOR lateColor = 0xffff967b;
         D3DCOLOR missHaloColor = 0xd812191f;
@@ -233,9 +241,11 @@ namespace
         ini.Number(L"Display", L"Direct", config.direct, 0, 1);
         ini.Number(L"Display", L"Chain", config.chain, 0, 1);
         ini.Number(L"Display", L"DirectMiss", config.directMiss, 0, 1);
+        ini.Number(L"Display", L"DirectRejected", config.directRejected, 0, 1);
         ini.Number(L"Display", L"ChainMiss", config.chainMiss, 0, 1);
 
         ini.Number(L"Geometry", L"InnerRadius", config.innerRadius, 1, 300);
+        ini.Number(L"Geometry", L"MaxRadius", config.maxRadius, 0, 1200);
         ini.Number(L"Geometry", L"PixelsPerFrame", config.pixelsPerFrame, 0.5, 40);
         ini.Number(L"Geometry", L"RingWidth", config.ringWidth, 0.1, 20);
         ini.Number(L"Geometry", L"RingHalo", config.ringHalo, 0, 20);
@@ -260,6 +270,7 @@ namespace
         ini.Color(L"NearMiss", L"LabelBackground", config.labelBackground);
 
         ReadRingColors(ini, L"DirectColors", config.directColors);
+        ini.Color(L"DirectColors", L"RejectedLine", config.rejectedColor);
 
         ReadRingColors(ini, L"ChainColors", config.chainColors);
         return config;
@@ -374,9 +385,33 @@ namespace
         return {std::max(scan, std::min(first, earliest)), end};
     }
 
-    unsigned RecoveryFrames()
+    struct RingGeometry
     {
-        return static_cast<unsigned>(std::ceil(settings.innerRadius / settings.pixelsPerFrame));
+        float innerRadius;
+        float pixelsPerFrame;
+    };
+
+    RingGeometry GeometryFor(FrameWindow window)
+    {
+        RingGeometry geometry{settings.innerRadius, settings.pixelsPerFrame};
+        if (!settings.maxRadius)
+            return geometry;
+
+        const float limit = static_cast<float>(settings.maxRadius);
+        geometry.innerRadius = std::min(geometry.innerRadius, limit - std::min(1.0f, limit * 0.5f));
+        if (window)
+        {
+            // Fit unusually wide bands using one scale across the whole window.
+            const float frameCount = static_cast<float>(window.end - window.begin);
+            geometry.pixelsPerFrame = std::min(geometry.pixelsPerFrame, (limit - geometry.innerRadius) / frameCount);
+        }
+        return geometry;
+    }
+
+    unsigned RecoveryFrames(FrameWindow window)
+    {
+        const auto geometry = GeometryFor(window);
+        return static_cast<unsigned>(std::ceil(geometry.innerRadius / geometry.pixelsPerFrame));
     }
 
     struct RingTiming
@@ -425,7 +460,7 @@ namespace
                 // Split short gaps between recovery and anticipation. In a
                 // long gap, let the ring disappear before cueing the next hit.
                 const unsigned gap = next.begin - window.end;
-                const unsigned recovery = std::min(gap / 2, RecoveryFrames());
+                const unsigned recovery = std::min(gap / 2, RecoveryFrames(window));
                 const unsigned leadIn = std::min(gap, settings.nextWindowLeadFrames);
                 const unsigned displayFrom = std::max(window.end + recovery, next.begin - leadIn);
                 if (frames.current < displayFrom)
@@ -533,11 +568,10 @@ namespace
     constexpr auto StrokeIndices = MakeStrokeIndices<false>();
     constexpr auto DashedStrokeIndices = MakeStrokeIndices<true>();
 
-    float RadiusAtFrame(float height, unsigned windowEnd, float frame)
+    float RadiusAtFrame(const RingGeometry& geometry, unsigned windowEnd, float frame)
     {
-        const float scale = std::max(0.5f, height / 900.0f);
         const float framesToClose = static_cast<float>(windowEnd) - frame;
-        return scale * std::max(0.0f, settings.innerRadius + framesToClose * settings.pixelsPerFrame);
+        return std::max(0.0f, geometry.innerRadius + framesToClose * geometry.pixelsPerFrame);
     }
 
     struct Vertex { float x, y, z, rhw; D3DCOLOR color; };
@@ -591,13 +625,11 @@ namespace
         DrawRingMesh(device, x, y, radii, colors, dashed);
     }
 
-    enum class RingStyle : std::uint8_t { Issen, Chain };
+    enum class RingStyle : std::uint8_t { Issen, Chain, IssenRejected };
 
-    void DrawWindowBand(IDirect3DDevice9* device, float x, float y, float height, FrameWindow window,
+    void DrawWindowBand(IDirect3DDevice9* device, float x, float y, float outer, float inner,
                         float scale, const RingColors& palette)
     {
-        const float outer = RadiusAtFrame(height, window.end, static_cast<float>(window.begin));
-        const float inner = RadiusAtFrame(height, window.end, static_cast<float>(window.end));
         // Keep the brighter edges completely inside the two frame boundaries.
         const float edgeWidth = std::min(settings.bandEdgeWidth * scale, (outer - inner) * 0.25f);
         const float radii[] = {outer, outer - edgeWidth * 0.5f, outer - edgeWidth,
@@ -684,27 +716,50 @@ namespace
         void Draw(float x, float y, const D3DVIEWPORT9& viewport, const RingTiming& timing, bool accepted,
                   RingStyle style = RingStyle::Issen, int offset = 0)
         {
-            const float height = static_cast<float>(viewport.Height);
-            const float radius = RadiusAtFrame(height, timing.window.end, timing.frame);
-            if ((!offset && radius <= 0.0f) || (!state && !Begin()))
+            const auto geometry = GeometryFor(timing.window);
+            const float radius = RadiusAtFrame(geometry, timing.window.end, timing.frame);
+            const float limit = settings.maxRadius ? static_cast<float>(settings.maxRadius)
+                                                   : std::numeric_limits<float>::infinity();
+            const bool rejected = style == RingStyle::IssenRejected;
+            const bool dashed = offset || rejected;
+
+            // Delay the live cue so it always appears while moving inward.
+            if (!dashed && (radius <= 0.0f || (radius > limit && timing.frame < static_cast<float>(timing.window.begin))))
+                return;
+            if (!state && !Begin())
                 return;
 
+            const float height = static_cast<float>(viewport.Height);
             const float scale = std::max(0.75f, height / 900.0f);
-            const auto& palette = (style == RingStyle::Chain ? settings.chainColors : settings.directColors)[accepted];
-            DrawWindowBand(device, x, y, height, timing.window, scale, palette);
-            if (offset)
-                DrawMiss(x, y, viewport, std::max(settings.missRadius * scale, radius), scale, offset);
+            const float radiusScale = std::max(0.5f, height / 900.0f);
+            const float screenRadius = std::min(radius, limit) * radiusScale;
+            const auto& colors = style == RingStyle::Chain ? settings.chainColors : settings.directColors;
+            const auto& palette = colors[accepted && !rejected];
+            if (timing.window)
+            {
+                const float outer = RadiusAtFrame(geometry, timing.window.end, static_cast<float>(timing.window.begin));
+                DrawWindowBand(device, x, y, std::min(outer, limit) * radiusScale, geometry.innerRadius * radiusScale,
+                               scale, palette);
+            }
+            if (dashed)
+            {
+                const auto color = rejected ? settings.rejectedColor : offset < 0 ? settings.earlyColor : settings.lateColor;
+                const float dashedRadius = std::min(std::max(settings.missRadius * scale, screenRadius), limit * radiusScale);
+                DrawDashed(x, y, viewport, dashedRadius, scale, offset, color);
+            }
             else
-                DrawRing(device, x, y, radius, settings.ringWidth * scale, settings.ringHalo * scale,
+                DrawRing(device, x, y, screenRadius, settings.ringWidth * scale, settings.ringHalo * scale,
                          palette.line, palette.halo);
         }
 
     private:
-        void DrawMiss(float x, float y, const D3DVIEWPORT9& viewport, float radius, float scale, int offset)
+        void DrawDashed(float x, float y, const D3DVIEWPORT9& viewport, float radius, float scale,
+                        int offset, D3DCOLOR color)
         {
-            const auto color = offset < 0 ? settings.earlyColor : settings.lateColor;
             DrawRing(device, x, y, radius, settings.missWidth * scale, settings.missHalo * scale,
                      color, settings.missHaloColor, true);
+            if (!offset)
+                return;
 
             const float pixel = std::max(1.25f, settings.labelPixelSize * scale);
             const float left = static_cast<float>(viewport.X);
@@ -793,6 +848,7 @@ namespace
     };
 
     std::vector<FrozenCue> frozenCues;
+    FrozenCue selectedInput;
     std::vector<EnemyRound> enemyRounds;
     unsigned nextRound;
 
@@ -824,27 +880,32 @@ namespace
         return entry == frozenCues.end() ? nullptr : &*entry;
     }
 
-    void FreezeCue(unsigned round, const WorldPoint& anchor, const RingTiming& timing, int offset, RingStyle style)
+    void StoreFrozenCue(const FrozenCue& cue)
     {
-        auto* previous = FindFrozenCue(round, timing.window);
-        if (previous && previous->offset == 0)
+        auto* previous = FindFrozenCue(cue.round, cue.timing.window);
+        if (previous && previous->offset == 0 && previous->style != RingStyle::IssenRejected &&
+            cue.style != RingStyle::IssenRejected)
             return;
 
-        const auto expires = GetTickCount64() + settings.inputHoldMs;
-        const auto frameOffset = static_cast<std::int8_t>(offset);
         if (previous)
         {
-            // An additional press in this window updates the result at its
-            // original position. A successful input remains the final result.
-            previous->expires = expires;
-            previous->timing = timing;
-            previous->offset = frameOffset;
+            // A rejected input gets its own press position. Subsequent
+            // timing results keep the position of the existing window cue.
+            const auto anchor = cue.style == RingStyle::IssenRejected ? cue.anchor : previous->anchor;
+            *previous = cue;
+            previous->anchor = anchor;
         }
         else
-            frozenCues.push_back({anchor, timing, expires, round, frameOffset, style});
+            frozenCues.push_back(cue);
     }
 
-    void FreezeEnemyCue(const EnemyNode* node, const MotionFrames& frames, const RingTiming& timing, int offset)
+    void FreezeCue(unsigned round, const WorldPoint& anchor, const RingTiming& timing, int offset, RingStyle style)
+    {
+        const auto expires = GetTickCount64() + settings.inputHoldMs;
+        StoreFrozenCue({anchor, timing, expires, round, static_cast<std::int8_t>(offset), style});
+    }
+
+    unsigned TrackEnemyInput(const EnemyNode* node, const MotionFrames& frames)
     {
         auto* round = FindEnemyRound(node);
         if (!round)
@@ -853,7 +914,22 @@ namespace
             round = &enemyRounds.back();
         }
         ObserveEnemyRound(*round, node, frames);
-        FreezeCue(round->id, ActorAnchor(node->actor), timing, offset, RingStyle::Issen);
+        return round->id;
+    }
+
+    void FreezeEnemyCue(const EnemyNode* node, const MotionFrames& frames, const RingTiming& timing, int offset)
+    {
+        FreezeCue(TrackEnemyInput(node, frames), ActorAnchor(node->actor), timing, offset, RingStyle::Issen);
+    }
+
+    const EnemyNode* FindTargetNode(const BYTE* enemy)
+    {
+        for (auto* node = EnemyList(); node; node = node->next)
+        {
+            if (node->actor == enemy)
+                return node;
+        }
+        return nullptr;
     }
 
     bool HasIssenHitTarget(const BYTE* enemy)
@@ -941,6 +1017,41 @@ namespace
         if (!target && settings.directMiss && settings.missFrames)
             RecordNearMiss(player);
         return target;
+    }
+
+    void CaptureSelectedInput(const BYTE* enemy)
+    {
+        const unsigned level = *At(Difficulty);
+        MotionFrames frames{};
+        RingTiming timing{};
+        if (level < ARRAYSIZE(DifficultyMasks) && Field<int>(enemy, 0x21e8) > 0 && ReadMotion(enemy, frames))
+            CalculateTiming(frames, DifficultyMasks[level], EffectiveMinimumFrames(), timing);
+
+        const auto* node = FindTargetNode(enemy);
+        const auto round = node ? TrackEnemyInput(node, frames) : ++nextRound;
+        // Keep the sampled frame and position across both native calls.
+        selectedInput = {ActorAnchor(enemy), timing, GetTickCount64() + settings.inputHoldMs,
+                         round, 0, RingStyle::IssenRejected};
+    }
+
+    void FinishSelectedInput(int result)
+    {
+        if (!result && selectedInput.round)
+            StoreFrozenCue(selectedInput);
+        selectedInput = {};
+    }
+
+    int __fastcall BindTargetWithCue(BYTE* player, const BYTE* enemy, int hitRegion)
+    {
+        selectedInput = {};
+        if (settings.directRejected && player == GetActivePlayer() && enemy)
+            CaptureSelectedInput(enemy);
+
+        using Bind = int (__fastcall *)(BYTE*, const BYTE*, int);
+        const int result = reinterpret_cast<Bind>(At(NativeBindTarget))(player, enemy, hitRegion);
+        if (!result)
+            FinishSelectedInput(result);
+        return result;
     }
 
     constexpr unsigned ChainFlags = 0x22f8;
@@ -1032,7 +1143,7 @@ namespace
         chainCue.pendingPress = 0;
         const FrameWindow window{0, chainCue.width};
         const int frame = tick - chainCue.openingTick;
-        const int recovery = settings.chain ? static_cast<int>(RecoveryFrames()) : 0;
+        const int recovery = settings.chain ? static_cast<int>(RecoveryFrames(window)) : 0;
         if (frame >= static_cast<int>(window.end) + std::max(missFrames, recovery))
         {
             chainCue = {};
@@ -1094,7 +1205,7 @@ namespace
         const int frame = chainCue.tick - chainCue.openingTick;
         if (chainCue.player != player || !chainCue.openingTick ||
             GetTickCount64() - chainCue.lastUpdate > ChainIdleTimeoutMs || (flags & ChainAccepted) ||
-            frame >= static_cast<int>(chainCue.width + RecoveryFrames()) || FindFrozenCue(chainCue.round, window))
+            frame >= static_cast<int>(chainCue.width + RecoveryFrames(window)) || FindFrozenCue(chainCue.round, window))
             return;
 
         float x, y;
@@ -1110,6 +1221,7 @@ namespace
     {
         using Commit = int (__thiscall *)(BYTE*);
         const int result = reinterpret_cast<Commit>(At(IssenCommit))(player);
+        FinishSelectedInput(result);
         if (!result || player != GetActivePlayer() || !settings.direct)
             return result;
 
@@ -1122,14 +1234,8 @@ namespace
             !CalculateTiming(frames, DifficultyMasks[level], EffectiveMinimumFrames(), timing) || !timing.open)
             return result;
 
-        for (auto* node = EnemyList(); node; node = node->next)
-        {
-            if (node->actor == enemy)
-            {
-                FreezeEnemyCue(node, frames, timing, 0);
-                break;
-            }
-        }
+        if (const auto* node = FindTargetNode(enemy))
+            FreezeEnemyCue(node, frames, timing, 0);
         return result;
     }
 
@@ -1200,6 +1306,7 @@ namespace
         if (!player)
         {
             frozenCues.clear();
+            selectedInput = {};
             enemyRounds.clear();
             chainCue = {};
             return;
@@ -1328,6 +1435,11 @@ extern "C" __declspec(dllexport) void InitializeASI()
 
     BYTE* inputSite = At(InputSelectCallSite);
     BYTE* commitSite = At(CommitCallSite);
+    BYTE* bindSite = At(BindTargetCallSite);
+    const bool bindSupported = settings.directRejected &&
+        !std::memcmp(bindSite, OriginalBindTargetCall, sizeof(OriginalBindTargetCall)) &&
+        !std::memcmp(At(NativeBindTarget), BindTargetThunk, sizeof(BindTargetThunk));
+    const auto bindCall = MakeCall(bindSite, reinterpret_cast<std::uintptr_t>(&BindTargetWithCue));
     const auto inputCall = MakeCall(inputSite, reinterpret_cast<std::uintptr_t>(&SelectFromInput));
     const auto commitCall = MakeCall(commitSite, reinterpret_cast<std::uintptr_t>(&CommitWithCue));
     BYTE* chainSetupSite = At(ChainSetupThunk);
@@ -1343,15 +1455,21 @@ extern "C" __declspec(dllexport) void InitializeASI()
         !std::memcmp(playerTimerSite, OriginalPlayerTimerCall, sizeof(OriginalPlayerTimerCall)) &&
         !std::memcmp(chainInputSite, OriginalChainInputCall, sizeof(OriginalChainInputCall));
 
-    Patch patches[] = {
+    Patch patches[7] = {
         {site, replacement, sizeof(replacement), 0},
         {inputSite, inputCall.data(), inputCall.size(), 0},
         {commitSite, commitCall.data(), commitCall.size(), 0},
-        {chainSetupSite, chainSetupJump.data(), chainSetupJump.size(), 0},
-        {playerTimerSite, playerTimerCall.data(), playerTimerCall.size(), 0},
-        {chainInputSite, chainInputCall.data(), chainInputCall.size(), 0},
     };
-    ApplyPatches(patches, chainSupported ? ARRAYSIZE(patches) : 3);
+    std::size_t patchCount = 3;
+    if (bindSupported)
+        patches[patchCount++] = {bindSite, bindCall.data(), bindCall.size(), 0};
+    if (chainSupported)
+    {
+        patches[patchCount++] = {chainSetupSite, chainSetupJump.data(), chainSetupJump.size(), 0};
+        patches[patchCount++] = {playerTimerSite, playerTimerCall.data(), playerTimerCall.size(), 0};
+        patches[patchCount++] = {chainInputSite, chainInputCall.data(), chainInputCall.size(), 0};
+    }
+    ApplyPatches(patches, patchCount);
 }
 
 BOOL WINAPI DllMain(HMODULE instance, DWORD reason, LPVOID)
