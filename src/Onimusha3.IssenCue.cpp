@@ -32,6 +32,12 @@ namespace
     constexpr BYTE CommitThunk[] = {0xe9, 0x29, 0x4d, 0x41, 0};
     constexpr std::uintptr_t WorldToScreen = 0x00408e9f;
     constexpr BYTE ProjectionThunk[] = {0xe9, 0xec, 0x37, 0x42, 0};
+    constexpr std::uintptr_t ChainSetupThunk = 0x00405eac;
+    constexpr BYTE OriginalChainSetupThunk[] = {0xe9, 0xdf, 0x31, 0x41, 0};
+    constexpr std::uintptr_t NativeChainSetup = 0x00819090;
+    constexpr std::uintptr_t PlayerTimerCallSite = 0x0081b0a2;
+    constexpr BYTE OriginalPlayerTimerCall[] = {0xe8, 0xa9, 0xe3, 0xff, 0xff};
+    constexpr std::uintptr_t NativePlayerTimer = 0x00819450;
 
     constexpr std::uintptr_t Player = 0x03caad40;
     constexpr std::uintptr_t EnemyListHead = 0x04239810;
@@ -48,8 +54,10 @@ namespace
     constexpr float TallEnemyHeight = 170.0f;
     constexpr ULONGLONG HoldAfterDeathMs = 3000;
     constexpr ULONGLONG FadeAfterDeathMs = 180;
-    constexpr int MaxMissFrames = 5;
-    constexpr ULONGLONG MissCueMs = 1800;
+    constexpr int MaxMissFrames = 10;
+    constexpr ULONGLONG MinMissCueMs = 2000;
+    constexpr ULONGLONG FadeMissCueMs = 180;
+    constexpr float MinMissRadius = 14.0f; // Pixels at 900p.
 
     constexpr std::uint32_t DifficultyMasks[] = {0x00200000, 0x04000000, 0x00100000, 0x00100000};
 
@@ -217,10 +225,15 @@ namespace
         return {std::max(scan, std::min(first, earliest)), end};
     }
 
+    constexpr float RadiusAtWindowEnd = 42.0f; // Pixels at 900p.
+    constexpr float RadiusPerFrame = 7.0f;
+    constexpr unsigned RecoveryFrames = static_cast<unsigned>(RadiusAtWindowEnd / RadiusPerFrame);
+    constexpr unsigned FollowupLeadInFrames = 12;
+
     struct RingPosition
     {
         float frame;
-        unsigned lastWindowEnd;
+        unsigned windowEnd;
     };
 
     struct RingTiming
@@ -248,7 +261,6 @@ namespace
 
         FrameWindow selected{};
         int selectedOffset = 0;
-        unsigned lastWindowEnd = 0;
 
         while (window)
         {
@@ -259,20 +271,27 @@ namespace
                 next = NextWindow(frames, window.end, mask, minimum);
             }
 
-            lastWindowEnd = window.end;
             const int offset = OffsetFromWindow(frames.current, window);
-            const bool selectWindow = nearestOffset
-                ? !selected || std::abs(offset) <= std::abs(selectedOffset)
-                : frames.current >= selected.end;
-            if (selectWindow)
+            if (!nearestOffset || !selected || std::abs(offset) <= std::abs(selectedOffset))
             {
                 selected = window;
                 selectedOffset = offset;
             }
+            if (next && !nearestOffset)
+            {
+                // Split short gaps between recovery and anticipation. In a
+                // long gap, let the ring disappear before cueing the next hit.
+                const unsigned gap = next.begin - window.end;
+                const unsigned recovery = std::min(gap / 2, RecoveryFrames);
+                const unsigned leadIn = std::min(gap, FollowupLeadInFrames);
+                const unsigned displayFrom = std::max(window.end + recovery, next.begin - leadIn);
+                if (frames.current < displayFrom)
+                    break;
+            }
             window = next;
         }
 
-        timing = {{frames.sample, lastWindowEnd}, selected, selectedOffset == 0};
+        timing = {{frames.sample, selected.end}, selected, selectedOffset == 0};
         if (nearestOffset)
             *nearestOffset = selectedOffset;
         return true;
@@ -337,8 +356,6 @@ namespace
     constexpr unsigned DashPeriod = 6;
     constexpr unsigned VisibleDashSteps = 4;
     constexpr float FullTurn = 6.28318530718f;
-    constexpr float RadiusAtLastWindowEnd = 42.0f; // Pixels at 900p.
-    constexpr float RadiusPerFrame = 7.0f;
 
     struct UnitPoint { float x, y; };
     std::array<UnitPoint, CircleSteps> circle;
@@ -372,13 +389,11 @@ namespace
     constexpr auto StrokeIndices = MakeStrokeIndices<false>();
     constexpr auto DashedStrokeIndices = MakeStrokeIndices<true>();
 
-    float RadiusAtFrame(float height, unsigned lastWindowEnd, float frame)
+    float RadiusAtFrame(float height, unsigned windowEnd, float frame)
     {
-        // Anchor the line at the final window's closing frame. Recovery
-        // remains visible until the radius reaches zero or this action ends.
         const float scale = std::max(0.5f, height / 900.0f);
-        const float framesToClose = static_cast<float>(lastWindowEnd) - frame;
-        return scale * std::max(0.0f, RadiusAtLastWindowEnd + framesToClose * RadiusPerFrame);
+        const float framesToClose = static_cast<float>(windowEnd) - frame;
+        return scale * std::max(0.0f, RadiusAtWindowEnd + framesToClose * RadiusPerFrame);
     }
 
     struct Vertex { float x, y, z, rhw; D3DCOLOR color; };
@@ -437,15 +452,31 @@ namespace
         DrawRingMesh(device, x, y, radii, colors, dashed);
     }
 
+    struct RingColors
+    {
+        D3DCOLOR edge, fill, line, halo;
+    };
+
+    enum class RingStyle { Issen, Chain };
+
+    constexpr RingColors IssenColors[] = {
+        {0xb4ffdca4, 0x67e8b25e, 0xf2fff3d5, 0xbc151319},
+        {0xdfffe29b, 0x84ffd05a, 0xffffd05a, 0xdc9a4505},
+    };
+    constexpr RingColors ChainColors[] = {
+        {0xc8c6aaff, 0x786f56cb, 0xf2e0ceff, 0xbc181128},
+        {0xfff1daff, 0x96ae79ff, 0xffedc3ff, 0xe05a279b},
+    };
+
     void DrawWindowBand(IDirect3DDevice9* device, float x, float y, float outer, float inner,
-                        float scale, bool accepted, unsigned opacity)
+                        float scale, const RingColors& palette, unsigned opacity)
     {
         // Keep the brighter edges completely inside the two frame boundaries.
         const float edgeWidth = std::min(0.8f * scale, (outer - inner) * 0.25f);
         const float radii[] = {outer, outer - edgeWidth * 0.5f, outer - edgeWidth,
                                inner + edgeWidth, inner + edgeWidth * 0.5f, inner};
-        const auto edge = ApplyOpacity(accepted ? 0xdfffe29b : 0xb4ffdca4, opacity);
-        const auto fill = ApplyOpacity(accepted ? 0x84ffd05a : 0x67e8b25e, opacity);
+        const auto edge = ApplyOpacity(palette.edge, opacity);
+        const auto fill = ApplyOpacity(palette.fill, opacity);
         const D3DCOLOR colors[] = {edge, edge, fill, fill, edge, edge};
         DrawRingMesh(device, x, y, radii, colors);
     }
@@ -453,23 +484,32 @@ namespace
     void DrawFrameOffset(IDirect3DDevice9* device, float x, float y, float scale,
                          int offset, D3DCOLOR color, unsigned opacity)
     {
-        // A five-pixel-high bitmap font keeps this small label independent of
-        // fonts and textures. The only supported magnitudes are 1 through 5.
-        constexpr char Glyphs[][16] = {
+        // A five-pixel-high bitmap font keeps the label independent of fonts and textures.
+        constexpr char Digits[][16] = {
+            "###" "#.#" "#.#" "#.#" "###",
             ".#." "##." ".#." ".#." "###",
             "###" "..#" "###" "#.." "###",
             "###" "..#" "###" "..#" "###",
             "#.#" "#.#" "###" "..#" "..#",
             "###" "#.." "###" "..#" "###",
-            "..." "..." "###" "..." "...",
-            "..." ".#." "###" ".#." "...",
+            "###" "#.." "###" "#.#" "###",
+            "###" "..#" "..#" ".#." ".#.",
+            "###" "#.#" "###" "#.#" "###",
+            "###" "#.#" "###" "..#" "###",
         };
-        static_assert(MaxMissFrames == 5);
-        const char* glyphs[] = {Glyphs[offset < 0 ? 5 : 6], Glyphs[std::abs(offset) - 1]};
+        constexpr char Minus[] = "..." "..." "###" "..." "...";
+        constexpr char Plus[] = "..." ".#." "###" ".#." "...";
+        static_assert(MaxMissFrames < 100);
+        const unsigned magnitude = static_cast<unsigned>(std::abs(offset));
+        const bool twoDigits = magnitude >= 10;
+        const char* glyphs[] = {offset < 0 ? Minus : Plus,
+                                Digits[twoDigits ? magnitude / 10 : magnitude], Digits[magnitude % 10]};
+        const unsigned glyphCount = twoDigits ? 3 : 2;
         const float pixel = std::max(1.25f, 1.8f * scale);
-        const float left = std::floor(x - 3.5f * pixel);
+        const float width = static_cast<float>(4 * glyphCount - 1) * pixel;
+        const float left = std::floor(x - width * 0.5f);
         const float top = std::floor(y);
-        std::array<Vertex, (1 + 2 * 15) * 6> vertices;
+        std::array<Vertex, (1 + 3 * 15) * 6> vertices;
         unsigned count = 0;
         const auto rectangle = [&](float x0, float y0, float x1, float y1, D3DCOLOR fill)
         {
@@ -480,9 +520,9 @@ namespace
             for (const auto& v : {a, b, c, c, b, d})
                 vertices[count++] = v;
         };
-        rectangle(left - 2.0f * pixel, top - pixel, left + 9.0f * pixel, top + 6.0f * pixel,
+        rectangle(left - 2.0f * pixel, top - pixel, left + width + 2.0f * pixel, top + 6.0f * pixel,
                   ApplyOpacity(0xd912191f, opacity));
-        for (unsigned glyph = 0; glyph < ARRAYSIZE(glyphs); ++glyph)
+        for (unsigned glyph = 0; glyph < glyphCount; ++glyph)
         {
             for (unsigned row = 0; row < 5; ++row)
             {
@@ -517,21 +557,22 @@ namespace
         Overlay(const Overlay&) = delete;
         Overlay& operator=(const Overlay&) = delete;
 
-        void Draw(float x, float y, float height, const RingTiming& timing, bool accepted, unsigned opacity = 255)
+        void Draw(float x, float y, float height, const RingTiming& timing, bool accepted,
+                  unsigned opacity = 255, RingStyle style = RingStyle::Issen)
         {
             const auto& position = timing.position;
-            const unsigned lastEnd = position.lastWindowEnd;
-            const float radius = RadiusAtFrame(height, lastEnd, position.frame);
+            const unsigned windowEnd = position.windowEnd;
+            const float radius = RadiusAtFrame(height, windowEnd, position.frame);
             if (radius <= 0.0f || (!state && !Begin()))
                 return;
 
             const float scale = std::max(0.75f, height / 900.0f);
-            DrawWindowBand(device, x, y, RadiusAtFrame(height, lastEnd, static_cast<float>(timing.window.begin)),
-                           RadiusAtFrame(height, lastEnd, static_cast<float>(timing.window.end)),
-                           scale, accepted, opacity);
+            const auto& palette = (style == RingStyle::Chain ? ChainColors : IssenColors)[accepted];
+            DrawWindowBand(device, x, y, RadiusAtFrame(height, windowEnd, static_cast<float>(timing.window.begin)),
+                           RadiusAtFrame(height, windowEnd, static_cast<float>(timing.window.end)),
+                           scale, palette, opacity);
             DrawRing(device, x, y, radius, 2.15f * scale, 1.10f * scale,
-                      ApplyOpacity(accepted ? 0xffffd05a : 0xf2fff3d5, opacity),
-                      ApplyOpacity(accepted ? 0xdc9a4505 : 0xbc151319, opacity));
+                     ApplyOpacity(palette.line, opacity), ApplyOpacity(palette.halo, opacity));
         }
 
         void DrawMiss(float x, float y, const D3DVIEWPORT9& viewport,
@@ -542,7 +583,8 @@ namespace
 
             const float height = static_cast<float>(viewport.Height);
             const float scale = std::max(0.75f, height / 900.0f);
-            const float radius = RadiusAtFrame(height, position.lastWindowEnd, position.frame);
+            const float radius = std::max(MinMissRadius * scale,
+                                          RadiusAtFrame(height, position.windowEnd, position.frame));
             const auto color = ApplyOpacity(offset < 0 ? 0xff78e7fa : 0xffff967b, opacity);
             DrawRing(device, x, y, radius, 1.2f * scale, 0.65f * scale, color,
                      ApplyOpacity(0xd812191f, opacity), true);
@@ -552,7 +594,7 @@ namespace
             const float top = static_cast<float>(viewport.Y);
             const float right = left + static_cast<float>(viewport.Width);
             const float bottom = top + height;
-            const float labelX = std::clamp(x + radius * 0.73f, left + 6.0f * pixel, right - 6.0f * pixel);
+            const float labelX = std::clamp(x + radius * 0.73f, left + 8.0f * pixel, right - 8.0f * pixel);
             const float labelY = std::clamp(y - radius * 0.73f - 5.0f * pixel, top + pixel, bottom - 6.0f * pixel);
             DrawFrameOffset(device, labelX, labelY, scale, offset, color, opacity);
         }
@@ -612,14 +654,21 @@ namespace
 
     struct MissCue
     {
+        WorldPoint anchor;
+        ULONGLONG expires;
+        RingPosition position;
         const EnemyNode* node;
         const BYTE* actor;
-        RingPosition position;
         int offset;
-        ULONGLONG expires;
     };
 
     MissCue missCue;
+
+    void SaveMissCue(const WorldPoint& anchor, RingPosition position, int offset, const EnemyNode* node = nullptr)
+    {
+        const auto expires = GetTickCount64() + MinMissCueMs + FadeMissCueMs;
+        missCue = {anchor, expires, position, node, node ? node->actor : nullptr, offset};
+    }
 
     bool HasIssenHitTarget(const BYTE* enemy)
     {
@@ -693,7 +742,7 @@ namespace
             const auto& entry = candidates[index];
             if (entry.node->actor == candidate)
             {
-                missCue = {entry.node, candidate, entry.position, entry.offset, GetTickCount64() + MissCueMs};
+                SaveMissCue(EnemyAnchor(candidate), entry.position, entry.offset, entry.node);
                 return;
             }
         }
@@ -709,22 +758,159 @@ namespace
 
     void DrawMissCue(Overlay& overlay, const D3DVIEWPORT9& viewport, const EnemyNode* node)
     {
-        if (!missCue.node)
+        if (!missCue.expires)
             return;
 
         const ULONGLONG now = GetTickCount64();
-        if (!node || now >= missCue.expires || Field<int>(node->actor, 0x21e8) <= 0)
+        if (now >= missCue.expires)
         {
             missCue = {};
             return;
         }
 
+        if (node && Field<int>(node->actor, 0x21e8) > 0)
+            missCue.anchor = EnemyAnchor(node->actor);
+        else
+        {
+            // Finish the display at the last known position if the actor is gone.
+            missCue.node = nullptr;
+            missCue.actor = nullptr;
+        }
+
         const ULONGLONG remaining = missCue.expires - now;
-        const unsigned opacity = static_cast<unsigned>(std::min<ULONGLONG>(remaining * 255 / 180, 255));
+        const unsigned opacity = static_cast<unsigned>(std::min(remaining * 255 / FadeMissCueMs, ULONGLONG{255}));
         float x, y;
-        const auto anchor = EnemyAnchor(node->actor);
-        if (ProjectAnchor(anchor, viewport, x, y))
+        if (ProjectAnchor(missCue.anchor, viewport, x, y))
             overlay.DrawMiss(x, y, viewport, missCue.position, missCue.offset, opacity);
+    }
+
+    constexpr unsigned ChainFlags = 0x22f8;
+    constexpr DWORD ChainAttack = 0x04;
+    constexpr DWORD ChainReady = 0x40;
+    constexpr DWORD ChainRejected = 0x80;
+    constexpr DWORD ChainAccepted = 0x100;
+    constexpr DWORD ChainArmed = 0x800;
+    constexpr unsigned ChainWidth = 0x44dc;
+    constexpr unsigned ChainRemaining = 0x44de;
+    constexpr unsigned ChainDelay = 0x44e2;
+    constexpr unsigned PressedCommands = 0x4454;
+    constexpr DWORD AttackPressed = 0x2000;
+    constexpr ULONGLONG ChainIdleTimeoutMs = 500;
+
+    struct ChainCue
+    {
+        WorldPoint anchor;
+        ULONGLONG lastUpdate;
+        const BYTE* player;
+        unsigned width;
+        int tick;
+        int openingTick;
+        int pendingPress;
+        bool anchored;
+    };
+
+    ChainCue chainCue;
+
+    void __fastcall SetupChainCue(BYTE* player, BYTE delay, unsigned continuation)
+    {
+        using Setup = void (__fastcall *)(BYTE*, BYTE, unsigned);
+        reinterpret_cast<Setup>(At(NativeChainSetup))(player, delay, continuation);
+        if (player != GetActivePlayer())
+            return;
+
+        chainCue = {};
+        const unsigned width = Field<std::uint16_t>(player, ChainWidth);
+        if (width)
+        {
+            chainCue.player = player;
+            chainCue.width = width;
+            chainCue.lastUpdate = GetTickCount64();
+        }
+    }
+
+    void __fastcall UpdateChainCue(BYTE* player)
+    {
+        using Update = void (__thiscall *)(BYTE*);
+        reinterpret_cast<Update>(At(NativePlayerTimer))(player);
+        if (player != chainCue.player)
+            return;
+
+        const DWORD flags = Field<DWORD>(player, ChainFlags);
+        if (!(flags & ChainAttack) || (flags & ChainAccepted))
+        {
+            chainCue = {};
+            return;
+        }
+
+        chainCue.lastUpdate = GetTickCount64();
+        const int tick = ++chainCue.tick;
+        const bool attack = (Field<DWORD>(player, PressedCommands) & AttackPressed) != 0;
+        if (!chainCue.openingTick)
+        {
+            if (!(flags & ChainArmed))
+            {
+                // The game only starts its countdown once the strike connects.
+                if (attack)
+                    chainCue.pendingPress = tick;
+                return;
+            }
+
+            // The delay's last tick is still closed. The last countdown tick
+            // is open even after the game decrements the remaining count to 0.
+            const auto delay = Field<std::uint16_t>(player, ChainDelay);
+            const auto remaining = Field<std::uint16_t>(player, ChainRemaining);
+            chainCue.openingTick = flags & ChainReady
+                ? std::max(1, tick - (static_cast<int>(chainCue.width) - remaining - 1))
+                : tick + delay + 1;
+        }
+
+        const int pressedAt = attack ? tick : chainCue.pendingPress;
+        chainCue.pendingPress = 0;
+        const FrameWindow window{0, chainCue.width};
+        const int frame = tick - chainCue.openingTick;
+        if (frame >= static_cast<int>(window.end) + MaxMissFrames)
+        {
+            chainCue = {};
+            return;
+        }
+        if (pressedAt)
+        {
+            const int pressedFrame = pressedAt - chainCue.openingTick;
+            const int offset = pressedFrame < 0 ? pressedFrame
+                : OffsetFromWindow(static_cast<unsigned>(pressedFrame), window);
+            if (offset && std::abs(offset) <= MaxMissFrames)
+            {
+                const auto anchor = chainCue.anchored ? chainCue.anchor : EnemyAnchor(player);
+                SaveMissCue(anchor, {static_cast<float>(pressedFrame), window.end}, offset);
+            }
+        }
+    }
+
+    void DrawChainCue(Overlay& overlay, const D3DVIEWPORT9& viewport, const BYTE* player)
+    {
+        if (chainCue.player != player || !chainCue.openingTick ||
+            GetTickCount64() - chainCue.lastUpdate > ChainIdleTimeoutMs)
+            return;
+
+        const DWORD flags = Field<DWORD>(player, ChainFlags);
+        const int frame = chainCue.tick - chainCue.openingTick;
+        if ((flags & ChainAccepted) || frame >= static_cast<int>(chainCue.width + RecoveryFrames))
+            return;
+
+        float x, y;
+        if (!chainCue.anchored)
+        {
+            chainCue.anchor = EnemyAnchor(player);
+            if (!ProjectAnchor(chainCue.anchor, viewport, x, y))
+                return;
+            chainCue.anchored = true;
+        }
+        else if (!ProjectAnchor(chainCue.anchor, viewport, x, y))
+            return;
+
+        const bool open = (flags & (ChainReady | ChainRejected)) == ChainReady;
+        const RingTiming timing{{static_cast<float>(frame), chainCue.width}, {0, chainCue.width}, open};
+        overlay.Draw(x, y, static_cast<float>(viewport.Height), timing, open, 255, RingStyle::Chain);
     }
 
     struct HeldCue
@@ -798,12 +984,7 @@ namespace
         // The preceding native call stored the selected victim at +2254.
         // This call succeeds only when the attack dispatcher commits to Issen.
         if (result && player == At(Player))
-        {
-            const auto* target = Field<const BYTE*>(player, 0x2254);
-            if (missCue.actor == target)
-                missCue = {};
-            HoldCue(target);
-        }
+            HoldCue(Field<const BYTE*>(player, 0x2254));
         return result;
     }
 
@@ -888,6 +1069,7 @@ namespace
         {
             heldCues = {};
             missCue = {};
+            chainCue = {};
             return;
         }
 
@@ -915,6 +1097,7 @@ namespace
         if (targetNode)
             DrawEnemy(overlay, viewport, targetNode, mask, minimum, true);
         DrawHeldCues(overlay, viewport);
+        DrawChainCue(overlay, viewport, player);
         DrawMissCue(overlay, viewport, missNode);
     }
 
@@ -1015,12 +1198,23 @@ extern "C" __declspec(dllexport) void InitializeASI()
     BYTE* commitSite = At(CommitCallSite);
     const auto inputCall = MakeCall(inputSite, reinterpret_cast<std::uintptr_t>(&SelectFromInput));
     const auto commitCall = MakeCall(commitSite, reinterpret_cast<std::uintptr_t>(&CommitWithCue));
+    BYTE* chainSetupSite = At(ChainSetupThunk);
+    BYTE* playerTimerSite = At(PlayerTimerCallSite);
+    auto chainSetupJump = MakeCall(chainSetupSite, reinterpret_cast<std::uintptr_t>(&SetupChainCue));
+    chainSetupJump[0] = 0xe9;
+    const auto playerTimerCall = MakeCall(playerTimerSite, reinterpret_cast<std::uintptr_t>(&UpdateChainCue));
+    const bool chainSupported =
+        !std::memcmp(chainSetupSite, OriginalChainSetupThunk, sizeof(OriginalChainSetupThunk)) &&
+        !std::memcmp(playerTimerSite, OriginalPlayerTimerCall, sizeof(OriginalPlayerTimerCall));
+
     Patch patches[] = {
         {site, replacement, sizeof(replacement), 0},
         {inputSite, inputCall.data(), inputCall.size(), 0},
         {commitSite, commitCall.data(), commitCall.size(), 0},
+        {chainSetupSite, chainSetupJump.data(), chainSetupJump.size(), 0},
+        {playerTimerSite, playerTimerCall.data(), playerTimerCall.size(), 0},
     };
-    ApplyPatches(patches, ARRAYSIZE(patches));
+    ApplyPatches(patches, chainSupported ? ARRAYSIZE(patches) : 3);
 }
 
 BOOL WINAPI DllMain(HMODULE instance, DWORD reason, LPVOID)
