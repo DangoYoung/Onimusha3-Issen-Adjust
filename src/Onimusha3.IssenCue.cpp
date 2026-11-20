@@ -13,6 +13,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
+#include <type_traits>
+#include <vector>
 
 namespace
 {
@@ -38,6 +41,9 @@ namespace
     constexpr std::uintptr_t PlayerTimerCallSite = 0x0081b0a2;
     constexpr BYTE OriginalPlayerTimerCall[] = {0xe8, 0xa9, 0xe3, 0xff, 0xff};
     constexpr std::uintptr_t NativePlayerTimer = 0x00819450;
+    constexpr std::uintptr_t ChainInputCallSite = 0x0081b201;
+    constexpr BYTE OriginalChainInputCall[] = {0xe8, 0xea, 0xdf, 0xff, 0xff};
+    constexpr std::uintptr_t NativeChainInput = 0x008191f0;
 
     constexpr std::uintptr_t Player = 0x03caad40;
     constexpr std::uintptr_t EnemyListHead = 0x04239810;
@@ -50,14 +56,51 @@ namespace
     constexpr std::uintptr_t WidescreenProjectionSite = 0x00433bca;
     constexpr std::uintptr_t DeviceSettings = 0x04260a0c;
 
-    constexpr float EnemyHeight = 90.0f;
-    constexpr float TallEnemyHeight = 170.0f;
-    constexpr ULONGLONG HoldAfterDeathMs = 3000;
-    constexpr ULONGLONG FadeAfterDeathMs = 180;
-    constexpr int MaxMissFrames = 10;
-    constexpr ULONGLONG MinMissCueMs = 2000;
-    constexpr ULONGLONG FadeMissCueMs = 180;
-    constexpr float MinMissRadius = 14.0f; // Pixels at 900p.
+    struct RingColors
+    {
+        D3DCOLOR edge, fill, line, halo;
+    };
+
+    struct CueSettings
+    {
+        bool direct = true;
+        bool chain = true;
+        bool directMiss = true;
+        bool chainMiss = true;
+        unsigned inputHoldMs = 2000;
+
+        float innerRadius = 42.0f;
+        float pixelsPerFrame = 7.0f;
+        float ringWidth = 2.15f;
+        float ringHalo = 1.10f;
+        float bandEdgeWidth = 0.8f;
+        float enemyHeight = 90.0f;
+        float tallEnemyHeight = 170.0f;
+        float playerHeight = 90.0f;
+        unsigned nextWindowLeadFrames = 12;
+
+
+        int missFrames = 10;
+        float missRadius = 14.0f;
+        float missWidth = 1.2f;
+        float missHalo = 0.65f;
+        float labelPixelSize = 1.8f;
+        D3DCOLOR earlyColor = 0xff78e7fa;
+        D3DCOLOR lateColor = 0xffff967b;
+        D3DCOLOR missHaloColor = 0xd812191f;
+        D3DCOLOR labelBackground = 0xd912191f;
+
+        RingColors directColors[2] = {
+            {0xb4ffdca4, 0x67e8b25e, 0xf2fff3d5, 0xbc151319},
+            {0xdfffe29b, 0x84ffd05a, 0xffffd05a, 0xdc9a4505},
+        };
+        RingColors chainColors[2] = {
+            {0xc8c6aaff, 0x786f56cb, 0xf2e0ceff, 0xbc181128},
+            {0xfff1daff, 0x96ae79ff, 0xffedc3ff, 0xe05a279b},
+        };
+    };
+
+    CueSettings settings;
 
     constexpr std::uint32_t DifficultyMasks[] = {0x00200000, 0x04000000, 0x00100000, 0x00100000};
 
@@ -109,18 +152,124 @@ namespace
         return result != 0xfe ? enemy : nullptr;
     }
 
+    template<std::size_t N>
+    bool SiblingIniPath(wchar_t (&path)[MAX_PATH], const wchar_t (&filename)[N])
+    {
+        const DWORD length = GetModuleFileNameW(cueModule, path, ARRAYSIZE(path));
+        if (!length || length >= ARRAYSIZE(path))
+            return false;
+
+        auto* slash = std::wcsrchr(path, L'\\');
+        if (!slash || ARRAYSIZE(path) - static_cast<std::size_t>(slash + 1 - path) < N)
+            return false;
+
+        std::memcpy(slash + 1, filename, sizeof(filename));
+        return true;
+    }
+
+    class CueIni
+    {
+    public:
+        explicit CueIni(const wchar_t* path) : path(path) {}
+
+        template<typename T>
+        void Number(const wchar_t* section, const wchar_t* key, T& setting, double min, double max) const
+        {
+            wchar_t text[48];
+            if (!Read(section, key, text))
+                return;
+
+            wchar_t* end = nullptr;
+            const double number = std::wcstod(text, &end);
+            if (end == text || *end || !(number >= min && number <= max))
+                return;
+
+            if constexpr (std::is_integral_v<T>)
+            {
+                if (std::trunc(number) != number)
+                    return;
+            }
+            setting = static_cast<T>(number);
+        }
+
+        void Color(const wchar_t* section, const wchar_t* key, D3DCOLOR& setting) const
+        {
+            wchar_t text[48];
+            if (!Read(section, key, text) || std::wcslen(text) != 8 || !std::iswxdigit(text[0]))
+                return;
+
+            wchar_t* end = nullptr;
+            const auto argb = std::wcstoul(text, &end, 16);
+            if (end == text + 8)
+                setting = argb;
+        }
+
+    private:
+        bool Read(const wchar_t* section, const wchar_t* key, wchar_t (&text)[48]) const
+        {
+            const DWORD count = GetPrivateProfileStringW(section, key, L"", text, ARRAYSIZE(text), path);
+            return count > 0 && count < ARRAYSIZE(text) - 1;
+        }
+
+        const wchar_t* path;
+    };
+
+    void ReadRingColors(const CueIni& ini, const wchar_t* section, RingColors (&colors)[2])
+    {
+        ini.Color(section, L"IdleEdge", colors[0].edge);
+        ini.Color(section, L"IdleFill", colors[0].fill);
+        ini.Color(section, L"IdleLine", colors[0].line);
+        ini.Color(section, L"IdleHalo", colors[0].halo);
+        ini.Color(section, L"ActiveEdge", colors[1].edge);
+        ini.Color(section, L"ActiveFill", colors[1].fill);
+        ini.Color(section, L"ActiveLine", colors[1].line);
+        ini.Color(section, L"ActiveHalo", colors[1].halo);
+    }
+
+    CueSettings ReadCueSettings(const wchar_t* path)
+    {
+        CueSettings config;
+        const CueIni ini(path);
+        ini.Number(L"Display", L"Direct", config.direct, 0, 1);
+        ini.Number(L"Display", L"Chain", config.chain, 0, 1);
+        ini.Number(L"Display", L"DirectMiss", config.directMiss, 0, 1);
+        ini.Number(L"Display", L"ChainMiss", config.chainMiss, 0, 1);
+
+        ini.Number(L"Geometry", L"InnerRadius", config.innerRadius, 1, 300);
+        ini.Number(L"Geometry", L"PixelsPerFrame", config.pixelsPerFrame, 0.5, 40);
+        ini.Number(L"Geometry", L"RingWidth", config.ringWidth, 0.1, 20);
+        ini.Number(L"Geometry", L"RingHalo", config.ringHalo, 0, 20);
+        ini.Number(L"Geometry", L"BandEdgeWidth", config.bandEdgeWidth, 0, 10);
+        ini.Number(L"Geometry", L"EnemyHeight", config.enemyHeight, -500, 500);
+        ini.Number(L"Geometry", L"TallEnemyHeight", config.tallEnemyHeight, -500, 500);
+        ini.Number(L"Geometry", L"PlayerHeight", config.playerHeight, -500, 500);
+
+        ini.Number(L"Direct", L"NextWindowLeadFrames", config.nextWindowLeadFrames, 0, 120);
+        // Existing INIs can supply the old near-miss duration as a default.
+        ini.Number(L"NearMiss", L"HoldMs", config.inputHoldMs, 0, 60000);
+        ini.Number(L"Display", L"InputHoldMs", config.inputHoldMs, 0, 60000);
+
+        ini.Number(L"NearMiss", L"MaxFrames", config.missFrames, 0, 99);
+        ini.Number(L"NearMiss", L"MinRadius", config.missRadius, 1, 300);
+        ini.Number(L"NearMiss", L"StrokeWidth", config.missWidth, 0.1, 20);
+        ini.Number(L"NearMiss", L"StrokeHalo", config.missHalo, 0, 20);
+        ini.Number(L"NearMiss", L"LabelPixelSize", config.labelPixelSize, 0.5, 10);
+        ini.Color(L"NearMiss", L"EarlyColor", config.earlyColor);
+        ini.Color(L"NearMiss", L"LateColor", config.lateColor);
+        ini.Color(L"NearMiss", L"HaloColor", config.missHaloColor);
+        ini.Color(L"NearMiss", L"LabelBackground", config.labelBackground);
+
+        ReadRingColors(ini, L"DirectColors", config.directColors);
+
+        ReadRingColors(ini, L"ChainColors", config.chainColors);
+        return config;
+    }
+
     unsigned ReadMinimumFrames()
     {
         wchar_t path[MAX_PATH];
-        const DWORD length = GetModuleFileNameW(cueModule, path, ARRAYSIZE(path));
-        if (!length || length >= ARRAYSIZE(path))
+        if (!SiblingIniPath(path, L"Onimusha3.IssenWindow.ini"))
             return 0;
-
-        auto* slash = std::wcsrchr(path, L'\\');
-        constexpr wchar_t ConfigName[] = L"Onimusha3.IssenWindow.ini";
-        if (!slash || ARRAYSIZE(path) - static_cast<std::size_t>(slash + 1 - path) < ARRAYSIZE(ConfigName))
-            return 0;
-        std::memcpy(slash + 1, ConfigName, sizeof(ConfigName));
 
         wchar_t value[16];
         const DWORD chars = GetPrivateProfileStringW(L"Issen", L"MinimumFrames", L"",
@@ -225,20 +374,14 @@ namespace
         return {std::max(scan, std::min(first, earliest)), end};
     }
 
-    constexpr float RadiusAtWindowEnd = 42.0f; // Pixels at 900p.
-    constexpr float RadiusPerFrame = 7.0f;
-    constexpr unsigned RecoveryFrames = static_cast<unsigned>(RadiusAtWindowEnd / RadiusPerFrame);
-    constexpr unsigned FollowupLeadInFrames = 12;
-
-    struct RingPosition
+    unsigned RecoveryFrames()
     {
-        float frame;
-        unsigned windowEnd;
-    };
+        return static_cast<unsigned>(std::ceil(settings.innerRadius / settings.pixelsPerFrame));
+    }
 
     struct RingTiming
     {
-        RingPosition position;
+        float frame;
         FrameWindow window;
         bool open;
     };
@@ -282,8 +425,8 @@ namespace
                 // Split short gaps between recovery and anticipation. In a
                 // long gap, let the ring disappear before cueing the next hit.
                 const unsigned gap = next.begin - window.end;
-                const unsigned recovery = std::min(gap / 2, RecoveryFrames);
-                const unsigned leadIn = std::min(gap, FollowupLeadInFrames);
+                const unsigned recovery = std::min(gap / 2, RecoveryFrames());
+                const unsigned leadIn = std::min(gap, settings.nextWindowLeadFrames);
                 const unsigned displayFrom = std::max(window.end + recovery, next.begin - leadIn);
                 if (frames.current < displayFrom)
                     break;
@@ -291,7 +434,7 @@ namespace
             window = next;
         }
 
-        timing = {{frames.sample, selected.end}, selected, selectedOffset == 0};
+        timing = {frames.sample, selected, selectedOffset == 0};
         if (nearestOffset)
             *nearestOffset = selectedOffset;
         return true;
@@ -309,10 +452,11 @@ namespace
 
     using ProjectPoint = int (__fastcall *)(ScreenPoint*, const WorldPoint*, float* inverseDepth);
 
-    WorldPoint EnemyAnchor(const BYTE* enemy)
+    WorldPoint ActorAnchor(const BYTE* actor)
     {
-        WorldPoint point = Field<WorldPoint>(enemy, 0x90);
-        point.y += enemy[2] == 0x34 ? TallEnemyHeight : EnemyHeight;
+        WorldPoint point = Field<WorldPoint>(actor, 0x90);
+        const float enemyHeight = actor[2] == 0x34 ? settings.tallEnemyHeight : settings.enemyHeight;
+        point.y += actor == At(Player) ? settings.playerHeight : enemyHeight;
         return point;
     }
 
@@ -339,8 +483,8 @@ namespace
         const auto wideDifference = viewport.Width * 9LL - viewport.Height * 16LL;
         if (At(WidescreenProjectionSite)[0] == 0xe9 && wideDifference >= -9 && wideDifference <= 9)
         {
-            const auto* settings = *reinterpret_cast<const DWORD* const*>(At(DeviceSettings));
-            if (settings && settings[12])
+            const auto* deviceSettings = *reinterpret_cast<const DWORD* const*>(At(DeviceSettings));
+            if (deviceSettings && deviceSettings[12])
                 width = height * (4.0f / 3.0f);
         }
 
@@ -393,7 +537,7 @@ namespace
     {
         const float scale = std::max(0.5f, height / 900.0f);
         const float framesToClose = static_cast<float>(windowEnd) - frame;
-        return scale * std::max(0.0f, RadiusAtWindowEnd + framesToClose * RadiusPerFrame);
+        return scale * std::max(0.0f, settings.innerRadius + framesToClose * settings.pixelsPerFrame);
     }
 
     struct Vertex { float x, y, z, rhw; D3DCOLOR color; };
@@ -405,11 +549,6 @@ namespace
             const float angle = FullTurn * static_cast<float>(step) / CircleSteps;
             circle[step] = {std::cos(angle), std::sin(angle)};
         }
-    }
-
-    D3DCOLOR ApplyOpacity(D3DCOLOR color, unsigned opacity)
-    {
-        return (color & 0x00ffffff) | (((color >> 24) * opacity / 255) << 24);
     }
 
     void DrawRingMesh(IDirect3DDevice9* device, float x, float y,
@@ -452,37 +591,23 @@ namespace
         DrawRingMesh(device, x, y, radii, colors, dashed);
     }
 
-    struct RingColors
+    enum class RingStyle : std::uint8_t { Issen, Chain };
+
+    void DrawWindowBand(IDirect3DDevice9* device, float x, float y, float height, FrameWindow window,
+                        float scale, const RingColors& palette)
     {
-        D3DCOLOR edge, fill, line, halo;
-    };
-
-    enum class RingStyle { Issen, Chain };
-
-    constexpr RingColors IssenColors[] = {
-        {0xb4ffdca4, 0x67e8b25e, 0xf2fff3d5, 0xbc151319},
-        {0xdfffe29b, 0x84ffd05a, 0xffffd05a, 0xdc9a4505},
-    };
-    constexpr RingColors ChainColors[] = {
-        {0xc8c6aaff, 0x786f56cb, 0xf2e0ceff, 0xbc181128},
-        {0xfff1daff, 0x96ae79ff, 0xffedc3ff, 0xe05a279b},
-    };
-
-    void DrawWindowBand(IDirect3DDevice9* device, float x, float y, float outer, float inner,
-                        float scale, const RingColors& palette, unsigned opacity)
-    {
+        const float outer = RadiusAtFrame(height, window.end, static_cast<float>(window.begin));
+        const float inner = RadiusAtFrame(height, window.end, static_cast<float>(window.end));
         // Keep the brighter edges completely inside the two frame boundaries.
-        const float edgeWidth = std::min(0.8f * scale, (outer - inner) * 0.25f);
+        const float edgeWidth = std::min(settings.bandEdgeWidth * scale, (outer - inner) * 0.25f);
         const float radii[] = {outer, outer - edgeWidth * 0.5f, outer - edgeWidth,
                                inner + edgeWidth, inner + edgeWidth * 0.5f, inner};
-        const auto edge = ApplyOpacity(palette.edge, opacity);
-        const auto fill = ApplyOpacity(palette.fill, opacity);
-        const D3DCOLOR colors[] = {edge, edge, fill, fill, edge, edge};
+        const D3DCOLOR colors[] = {palette.edge, palette.edge, palette.fill, palette.fill, palette.edge, palette.edge};
         DrawRingMesh(device, x, y, radii, colors);
     }
 
     void DrawFrameOffset(IDirect3DDevice9* device, float x, float y, float scale,
-                         int offset, D3DCOLOR color, unsigned opacity)
+                         int offset, D3DCOLOR color)
     {
         // A five-pixel-high bitmap font keeps the label independent of fonts and textures.
         constexpr char Digits[][16] = {
@@ -499,13 +624,12 @@ namespace
         };
         constexpr char Minus[] = "..." "..." "###" "..." "...";
         constexpr char Plus[] = "..." ".#." "###" ".#." "...";
-        static_assert(MaxMissFrames < 100);
         const unsigned magnitude = static_cast<unsigned>(std::abs(offset));
         const bool twoDigits = magnitude >= 10;
         const char* glyphs[] = {offset < 0 ? Minus : Plus,
                                 Digits[twoDigits ? magnitude / 10 : magnitude], Digits[magnitude % 10]};
         const unsigned glyphCount = twoDigits ? 3 : 2;
-        const float pixel = std::max(1.25f, 1.8f * scale);
+        const float pixel = std::max(1.25f, settings.labelPixelSize * scale);
         const float width = static_cast<float>(4 * glyphCount - 1) * pixel;
         const float left = std::floor(x - width * 0.5f);
         const float top = std::floor(y);
@@ -521,7 +645,7 @@ namespace
                 vertices[count++] = v;
         };
         rectangle(left - 2.0f * pixel, top - pixel, left + width + 2.0f * pixel, top + 6.0f * pixel,
-                  ApplyOpacity(0xd912191f, opacity));
+                  settings.labelBackground);
         for (unsigned glyph = 0; glyph < glyphCount; ++glyph)
         {
             for (unsigned row = 0; row < 5; ++row)
@@ -557,49 +681,45 @@ namespace
         Overlay(const Overlay&) = delete;
         Overlay& operator=(const Overlay&) = delete;
 
-        void Draw(float x, float y, float height, const RingTiming& timing, bool accepted,
-                  unsigned opacity = 255, RingStyle style = RingStyle::Issen)
+        void Draw(float x, float y, const D3DVIEWPORT9& viewport, const RingTiming& timing, bool accepted,
+                  RingStyle style = RingStyle::Issen, int offset = 0)
         {
-            const auto& position = timing.position;
-            const unsigned windowEnd = position.windowEnd;
-            const float radius = RadiusAtFrame(height, windowEnd, position.frame);
-            if (radius <= 0.0f || (!state && !Begin()))
-                return;
-
-            const float scale = std::max(0.75f, height / 900.0f);
-            const auto& palette = (style == RingStyle::Chain ? ChainColors : IssenColors)[accepted];
-            DrawWindowBand(device, x, y, RadiusAtFrame(height, windowEnd, static_cast<float>(timing.window.begin)),
-                           RadiusAtFrame(height, windowEnd, static_cast<float>(timing.window.end)),
-                           scale, palette, opacity);
-            DrawRing(device, x, y, radius, 2.15f * scale, 1.10f * scale,
-                     ApplyOpacity(palette.line, opacity), ApplyOpacity(palette.halo, opacity));
-        }
-
-        void DrawMiss(float x, float y, const D3DVIEWPORT9& viewport,
-                      const RingPosition& position, int offset, unsigned opacity)
-        {
-            if (!state && !Begin())
-                return;
-
             const float height = static_cast<float>(viewport.Height);
-            const float scale = std::max(0.75f, height / 900.0f);
-            const float radius = std::max(MinMissRadius * scale,
-                                          RadiusAtFrame(height, position.windowEnd, position.frame));
-            const auto color = ApplyOpacity(offset < 0 ? 0xff78e7fa : 0xffff967b, opacity);
-            DrawRing(device, x, y, radius, 1.2f * scale, 0.65f * scale, color,
-                     ApplyOpacity(0xd812191f, opacity), true);
+            const float radius = RadiusAtFrame(height, timing.window.end, timing.frame);
+            if ((!offset && radius <= 0.0f) || (!state && !Begin()))
+                return;
 
-            const float pixel = std::max(1.25f, 1.8f * scale);
-            const float left = static_cast<float>(viewport.X);
-            const float top = static_cast<float>(viewport.Y);
-            const float right = left + static_cast<float>(viewport.Width);
-            const float bottom = top + height;
-            const float labelX = std::clamp(x + radius * 0.73f, left + 8.0f * pixel, right - 8.0f * pixel);
-            const float labelY = std::clamp(y - radius * 0.73f - 5.0f * pixel, top + pixel, bottom - 6.0f * pixel);
-            DrawFrameOffset(device, labelX, labelY, scale, offset, color, opacity);
+            const float scale = std::max(0.75f, height / 900.0f);
+            const auto& palette = (style == RingStyle::Chain ? settings.chainColors : settings.directColors)[accepted];
+            DrawWindowBand(device, x, y, height, timing.window, scale, palette);
+            if (offset)
+                DrawMiss(x, y, viewport, std::max(settings.missRadius * scale, radius), scale, offset);
+            else
+                DrawRing(device, x, y, radius, settings.ringWidth * scale, settings.ringHalo * scale,
+                         palette.line, palette.halo);
         }
 
     private:
+        void DrawMiss(float x, float y, const D3DVIEWPORT9& viewport, float radius, float scale, int offset)
+        {
+            const auto color = offset < 0 ? settings.earlyColor : settings.lateColor;
+            DrawRing(device, x, y, radius, settings.missWidth * scale, settings.missHalo * scale,
+                     color, settings.missHaloColor, true);
+
+            const float pixel = std::max(1.25f, settings.labelPixelSize * scale);
+            const float left = static_cast<float>(viewport.X);
+            const float top = static_cast<float>(viewport.Y);
+            const float right = left + static_cast<float>(viewport.Width);
+            const float height = static_cast<float>(viewport.Height);
+            const float bottom = top + height;
+            const float labelMargin = std::min(8.0f * pixel, (right - left) * 0.5f);
+            const float clampedPixel = std::min(pixel, height / 7.0f);
+            const float labelX = std::clamp(x + radius * 0.73f, left + labelMargin, right - labelMargin);
+            const float labelY = std::clamp(y - radius * 0.73f - 5.0f * pixel,
+                                            top + clampedPixel, bottom - 6.0f * clampedPixel);
+            DrawFrameOffset(device, labelX, labelY, scale, offset, color);
+        }
+
         bool Begin()
         {
             if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &state)))
@@ -652,22 +772,88 @@ namespace
         return *reinterpret_cast<const EnemyNode* const*>(At(EnemyListHead));
     }
 
-    struct MissCue
+    struct FrozenCue
     {
         WorldPoint anchor;
+        RingTiming timing;
         ULONGLONG expires;
-        RingPosition position;
-        const EnemyNode* node;
-        const BYTE* actor;
-        int offset;
+        unsigned round;
+        std::int8_t offset;
+        RingStyle style;
     };
 
-    MissCue missCue;
-
-    void SaveMissCue(const WorldPoint& anchor, RingPosition position, int offset, const EnemyNode* node = nullptr)
+    struct EnemyRound
     {
-        const auto expires = GetTickCount64() + MinMissCueMs + FadeMissCueMs;
-        missCue = {anchor, expires, position, node, node ? node->actor : nullptr, offset};
+        const EnemyNode* node;
+        const BYTE* actor;
+        const std::uint32_t* frames;
+        unsigned frame;
+        unsigned id;
+        bool seen;
+    };
+
+    std::vector<FrozenCue> frozenCues;
+    std::vector<EnemyRound> enemyRounds;
+    unsigned nextRound;
+
+    EnemyRound* FindEnemyRound(const EnemyNode* node)
+    {
+        const auto entry = std::find_if(enemyRounds.begin(), enemyRounds.end(),
+            [node](const EnemyRound& round) { return round.node == node; });
+        return entry == enemyRounds.end() ? nullptr : &*entry;
+    }
+
+    void ObserveEnemyRound(EnemyRound& round, const EnemyNode* node, const MotionFrames& frames)
+    {
+        if (round.actor != node->actor || round.frames != frames.flags || frames.current < round.frame)
+        {
+            round.actor = node->actor;
+            round.frames = frames.flags;
+            round.id = ++nextRound;
+        }
+        round.frame = frames.current;
+    }
+
+    FrozenCue* FindFrozenCue(unsigned round, FrameWindow window)
+    {
+        const auto entry = std::find_if(frozenCues.begin(), frozenCues.end(),
+            [round, window](const FrozenCue& cue)
+            {
+                return cue.round == round && cue.timing.window.end == window.end;
+            });
+        return entry == frozenCues.end() ? nullptr : &*entry;
+    }
+
+    void FreezeCue(unsigned round, const WorldPoint& anchor, const RingTiming& timing, int offset, RingStyle style)
+    {
+        auto* previous = FindFrozenCue(round, timing.window);
+        if (previous && previous->offset == 0)
+            return;
+
+        const auto expires = GetTickCount64() + settings.inputHoldMs;
+        const auto frameOffset = static_cast<std::int8_t>(offset);
+        if (previous)
+        {
+            // An additional press in this window updates the result at its
+            // original position. A successful input remains the final result.
+            previous->expires = expires;
+            previous->timing = timing;
+            previous->offset = frameOffset;
+        }
+        else
+            frozenCues.push_back({anchor, timing, expires, round, frameOffset, style});
+    }
+
+    void FreezeEnemyCue(const EnemyNode* node, const MotionFrames& frames, const RingTiming& timing, int offset)
+    {
+        auto* round = FindEnemyRound(node);
+        if (!round)
+        {
+            enemyRounds.push_back({node, nullptr, nullptr, 0, 0, false});
+            round = &enemyRounds.back();
+        }
+        ObserveEnemyRound(*round, node, frames);
+        FreezeCue(round->id, ActorAnchor(node->actor), timing, offset, RingStyle::Issen);
     }
 
     bool HasIssenHitTarget(const BYTE* enemy)
@@ -701,7 +887,8 @@ namespace
         {
             const EnemyNode* node;
             std::uint32_t* activeFlags;
-            RingPosition position;
+            MotionFrames frames;
+            RingTiming timing;
             int offset;
         };
         std::array<Candidate, 32> candidates;
@@ -715,13 +902,13 @@ namespace
             int offset = 0;
             if (!HasIssenHitTarget(enemy) || !ReadMotion(enemy, frames) ||
                 !CalculateTiming(frames, mask, minimum, timing, &offset) ||
-                !offset || std::abs(offset) > MaxMissFrames)
+                !offset || std::abs(offset) > settings.missFrames)
                 continue;
 
             auto* motion = Field<BYTE*>(enemy, 0x30);
             auto* activeFlags = reinterpret_cast<std::uint32_t*>(motion + 0xb4);
             if (!(*activeFlags & mask))
-                candidates[count++] = {node, activeFlags, timing.position, offset};
+                candidates[count++] = {node, activeFlags, frames, timing, offset};
         }
 
         if (!count)
@@ -742,7 +929,7 @@ namespace
             const auto& entry = candidates[index];
             if (entry.node->actor == candidate)
             {
-                SaveMissCue(EnemyAnchor(candidate), entry.position, entry.offset, entry.node);
+                FreezeEnemyCue(entry.node, entry.frames, entry.timing, entry.offset);
                 return;
             }
         }
@@ -751,37 +938,9 @@ namespace
     BYTE* __fastcall SelectFromInput(BYTE* player, BYTE* result)
     {
         auto* target = reinterpret_cast<SelectIssen>(At(IssenSelector))(player, result);
-        if (!target)
+        if (!target && settings.directMiss && settings.missFrames)
             RecordNearMiss(player);
         return target;
-    }
-
-    void DrawMissCue(Overlay& overlay, const D3DVIEWPORT9& viewport, const EnemyNode* node)
-    {
-        if (!missCue.expires)
-            return;
-
-        const ULONGLONG now = GetTickCount64();
-        if (now >= missCue.expires)
-        {
-            missCue = {};
-            return;
-        }
-
-        if (node && Field<int>(node->actor, 0x21e8) > 0)
-            missCue.anchor = EnemyAnchor(node->actor);
-        else
-        {
-            // Finish the display at the last known position if the actor is gone.
-            missCue.node = nullptr;
-            missCue.actor = nullptr;
-        }
-
-        const ULONGLONG remaining = missCue.expires - now;
-        const unsigned opacity = static_cast<unsigned>(std::min(remaining * 255 / FadeMissCueMs, ULONGLONG{255}));
-        float x, y;
-        if (ProjectAnchor(missCue.anchor, viewport, x, y))
-            overlay.DrawMiss(x, y, viewport, missCue.position, missCue.offset, opacity);
     }
 
     constexpr unsigned ChainFlags = 0x22f8;
@@ -799,14 +958,14 @@ namespace
 
     struct ChainCue
     {
-        WorldPoint anchor;
+        WorldPoint pendingAnchor;
         ULONGLONG lastUpdate;
         const BYTE* player;
+        unsigned round;
         unsigned width;
         int tick;
         int openingTick;
         int pendingPress;
-        bool anchored;
     };
 
     ChainCue chainCue;
@@ -823,6 +982,7 @@ namespace
         if (width)
         {
             chainCue.player = player;
+            chainCue.round = ++nextRound;
             chainCue.width = width;
             chainCue.lastUpdate = GetTickCount64();
         }
@@ -844,19 +1004,23 @@ namespace
 
         chainCue.lastUpdate = GetTickCount64();
         const int tick = ++chainCue.tick;
-        const bool attack = (Field<DWORD>(player, PressedCommands) & AttackPressed) != 0;
+        const int missFrames = settings.chainMiss ? settings.missFrames : 0;
+        const bool attack = missFrames && (Field<DWORD>(player, PressedCommands) & AttackPressed);
         if (!chainCue.openingTick)
         {
             if (!(flags & ChainArmed))
             {
                 // The game only starts its countdown once the strike connects.
                 if (attack)
+                {
                     chainCue.pendingPress = tick;
+                    chainCue.pendingAnchor = ActorAnchor(player);
+                }
                 return;
             }
 
-            // The delay's last tick is still closed. The last countdown tick
-            // is open even after the game decrements the remaining count to 0.
+            // The last delay tick is closed. The last countdown tick is open
+            // even after the game decrements the remaining count to zero.
             const auto delay = Field<std::uint16_t>(player, ChainDelay);
             const auto remaining = Field<std::uint16_t>(player, ChainRemaining);
             chainCue.openingTick = flags & ChainReady
@@ -868,7 +1032,8 @@ namespace
         chainCue.pendingPress = 0;
         const FrameWindow window{0, chainCue.width};
         const int frame = tick - chainCue.openingTick;
-        if (frame >= static_cast<int>(window.end) + MaxMissFrames)
+        const int recovery = settings.chain ? static_cast<int>(RecoveryFrames()) : 0;
+        if (frame >= static_cast<int>(window.end) + std::max(missFrames, recovery))
         {
             chainCue = {};
             return;
@@ -878,137 +1043,94 @@ namespace
             const int pressedFrame = pressedAt - chainCue.openingTick;
             const int offset = pressedFrame < 0 ? pressedFrame
                 : OffsetFromWindow(static_cast<unsigned>(pressedFrame), window);
-            if (offset && std::abs(offset) <= MaxMissFrames)
+            if (offset && std::abs(offset) <= missFrames)
             {
-                const auto anchor = chainCue.anchored ? chainCue.anchor : EnemyAnchor(player);
-                SaveMissCue(anchor, {static_cast<float>(pressedFrame), window.end}, offset);
+                const auto anchor = attack ? ActorAnchor(player) : chainCue.pendingAnchor;
+                const RingTiming timing{static_cast<float>(pressedFrame), window, false};
+                FreezeCue(chainCue.round, anchor, timing, offset, RingStyle::Chain);
             }
+        }
+    }
+
+    void __fastcall RecordChainCommit(const BYTE* player)
+    {
+        if (!settings.chain || chainCue.player != player || !chainCue.openingTick ||
+            !(Field<DWORD>(player, ChainFlags) & ChainAccepted) ||
+            !(Field<DWORD>(player, PressedCommands) & AttackPressed))
+            return;
+
+        const FrameWindow window{0, chainCue.width};
+        const int frame = chainCue.tick - chainCue.openingTick;
+        if (frame >= 0 && static_cast<unsigned>(frame) < window.end)
+        {
+            const RingTiming timing{static_cast<float>(frame), window, true};
+            FreezeCue(chainCue.round, ActorAnchor(player), timing, 0, RingStyle::Chain);
+        }
+    }
+
+    BYTE* nativeChainInput;
+
+    // The original handler receives the player in EDX and its caller still
+    // needs EDX afterward. Preserve the original register and flag results.
+    void __declspec(naked) ChainInputWithCue()
+    {
+        __asm
+        {
+            call dword ptr [nativeChainInput]
+            pushfd
+            pushad
+            mov ecx, edx
+            call RecordChainCommit
+            popad
+            popfd
+            ret
         }
     }
 
     void DrawChainCue(Overlay& overlay, const D3DVIEWPORT9& viewport, const BYTE* player)
     {
-        if (chainCue.player != player || !chainCue.openingTick ||
-            GetTickCount64() - chainCue.lastUpdate > ChainIdleTimeoutMs)
-            return;
-
         const DWORD flags = Field<DWORD>(player, ChainFlags);
+        const FrameWindow window{0, chainCue.width};
         const int frame = chainCue.tick - chainCue.openingTick;
-        if ((flags & ChainAccepted) || frame >= static_cast<int>(chainCue.width + RecoveryFrames))
+        if (chainCue.player != player || !chainCue.openingTick ||
+            GetTickCount64() - chainCue.lastUpdate > ChainIdleTimeoutMs || (flags & ChainAccepted) ||
+            frame >= static_cast<int>(chainCue.width + RecoveryFrames()) || FindFrozenCue(chainCue.round, window))
             return;
 
         float x, y;
-        if (!chainCue.anchored)
+        if (ProjectAnchor(ActorAnchor(player), viewport, x, y))
         {
-            chainCue.anchor = EnemyAnchor(player);
-            if (!ProjectAnchor(chainCue.anchor, viewport, x, y))
-                return;
-            chainCue.anchored = true;
+            const bool open = (flags & (ChainReady | ChainRejected)) == ChainReady;
+            const RingTiming timing{static_cast<float>(frame), window, open};
+            overlay.Draw(x, y, viewport, timing, open, RingStyle::Chain);
         }
-        else if (!ProjectAnchor(chainCue.anchor, viewport, x, y))
-            return;
-
-        const bool open = (flags & (ChainReady | ChainRejected)) == ChainReady;
-        const RingTiming timing{{static_cast<float>(frame), chainCue.width}, {0, chainCue.width}, open};
-        overlay.Draw(x, y, static_cast<float>(viewport.Height), timing, open, 255, RingStyle::Chain);
-    }
-
-    struct HeldCue
-    {
-        WorldPoint anchor;
-        ULONGLONG expires;
-        RingTiming timing;
-        const EnemyNode* node;
-        const BYTE* actor;
-        const std::uint32_t* attackFlags;
-        std::uint16_t lastFrame;
-        bool onOriginalAttack;
-        bool seenAlive;
-    };
-
-    std::array<HeldCue, 32> heldCues;
-
-    HeldCue* FindLiveCue(const EnemyNode* node)
-    {
-        for (auto& cue : heldCues)
-        {
-            if (cue.node == node && cue.actor == node->actor && !cue.expires)
-                return &cue;
-        }
-        return nullptr;
-    }
-
-    void HoldCue(const BYTE* enemy)
-    {
-        if (!enemy)
-            return;
-
-        const unsigned level = *At(Difficulty);
-        MotionFrames frames{};
-        RingTiming timing{};
-        if (level >= ARRAYSIZE(DifficultyMasks) || !ReadMotion(enemy, frames) ||
-            !CalculateTiming(frames, DifficultyMasks[level], EffectiveMinimumFrames(), timing))
-            return;
-
-        auto* node = EnemyList();
-        while (node && node->actor != enemy)
-            node = node->next;
-        if (!node)
-            return;
-
-        auto* cue = FindLiveCue(node);
-        if (!cue)
-        {
-            // Free slots precede expired cues. Keep every live cue unless the
-            // fixed storage is full and the game has no expired cue to reuse.
-            const auto slot = std::min_element(heldCues.begin(), heldCues.end(),
-                [](const HeldCue& left, const HeldCue& right) {
-                    const ULONGLONG live = ~ULONGLONG{0};
-                    const auto priority = [=](const HeldCue& entry) {
-                        return !entry.node ? ULONGLONG{0} : entry.expires ? entry.expires : live;
-                    };
-                    return priority(left) < priority(right);
-                });
-            if (slot->node && !slot->expires)
-                return;
-            cue = &*slot;
-        }
-        *cue = {EnemyAnchor(enemy), 0, timing, node, enemy, frames.flags,
-                static_cast<std::uint16_t>(frames.current), true, false};
     }
 
     int __fastcall CommitWithCue(BYTE* player)
     {
         using Commit = int (__thiscall *)(BYTE*);
         const int result = reinterpret_cast<Commit>(At(IssenCommit))(player);
+        if (!result || player != GetActivePlayer() || !settings.direct)
+            return result;
+
         // The preceding native call stored the selected victim at +2254.
-        // This call succeeds only when the attack dispatcher commits to Issen.
-        if (result && player == At(Player))
-            HoldCue(Field<const BYTE*>(player, 0x2254));
-        return result;
-    }
+        const auto* enemy = Field<const BYTE*>(player, 0x2254);
+        const unsigned level = *At(Difficulty);
+        MotionFrames frames{};
+        RingTiming timing{};
+        if (!enemy || level >= ARRAYSIZE(DifficultyMasks) || !ReadMotion(enemy, frames) ||
+            !CalculateTiming(frames, DifficultyMasks[level], EffectiveMinimumFrames(), timing) || !timing.open)
+            return result;
 
-    bool TrackHeldCue(const EnemyNode* node, const MotionFrames& frames, bool timedAttack)
-    {
-        auto* cue = FindLiveCue(node);
-        if (!cue)
-            return false;
-
-        const bool sameAttack = cue->onOriginalAttack && frames.flags == cue->attackFlags &&
-                                frames.current >= cue->lastFrame;
-        if (timedAttack && !sameAttack)
+        for (auto* node = EnemyList(); node; node = node->next)
         {
-            *cue = {};
-            return false;
+            if (node->actor == enemy)
+            {
+                FreezeEnemyCue(node, frames, timing, 0);
+                break;
+            }
         }
-
-        // Idle and hit reactions leave the frozen radius intact. A restart
-        // on the same animation table counts as a new attack when it wraps.
-        cue->onOriginalAttack = sameAttack;
-        cue->lastFrame = static_cast<std::uint16_t>(frames.current);
-        cue->anchor = EnemyAnchor(node->actor);
-        cue->seenAlive = true;
-        return true;
+        return result;
     }
 
     void DrawEnemy(Overlay& overlay, const D3DVIEWPORT9& viewport, const EnemyNode* node,
@@ -1018,45 +1140,55 @@ namespace
         if (!enemy || Field<int>(enemy, 0x21e8) <= 0)
             return;
 
+        auto* round = FindEnemyRound(node);
+        if (!settings.direct && !round)
+            return;
+
         MotionFrames frames{};
+        const bool hasMotion = ReadMotion(enemy, frames);
+        if (round)
+        {
+            ObserveEnemyRound(*round, node, frames);
+            round->seen = true;
+        }
+
         RingTiming timing{};
-        const bool timedAttack = ReadMotion(enemy, frames) && CalculateTiming(frames, mask, minimum, timing);
-        if (TrackHeldCue(node, frames, timedAttack) || !timedAttack ||
-            !enemy[0xef] || !(enemy[0x0a] & 4))
+        if (!settings.direct || !hasMotion || !enemy[0xef] || !(enemy[0x0a] & 4) || !CalculateTiming(frames, mask, minimum, timing) ||
+            (round && FindFrozenCue(round->id, timing.window)))
             return;
 
         float x, y;
-        const auto anchor = EnemyAnchor(enemy);
-        if (ProjectAnchor(anchor, viewport, x, y))
-            overlay.Draw(x, y, static_cast<float>(viewport.Height), timing, selected && timing.open);
+        if (ProjectAnchor(ActorAnchor(enemy), viewport, x, y))
+            overlay.Draw(x, y, viewport, timing, selected && timing.open);
     }
 
-    void DrawHeldCues(Overlay& overlay, const D3DVIEWPORT9& viewport)
+    void DrawFrozenCues(Overlay& overlay, const D3DVIEWPORT9& viewport)
     {
-        const ULONGLONG now = GetTickCount64();
-        for (auto& cue : heldCues)
+        enemyRounds.erase(std::remove_if(enemyRounds.begin(), enemyRounds.end(), [](EnemyRound& round)
         {
-            if (!cue.node)
-                continue;
-            // A missing actor can already have been freed. Keep the last
-            // world position without accessing the stored actor or node.
-            if (!cue.seenAlive && !cue.expires)
-                cue.expires = now + HoldAfterDeathMs;
-            cue.seenAlive = false;
-            if (cue.expires && now >= cue.expires)
-            {
-                cue = {};
-                continue;
-            }
+            const bool unseen = !round.seen;
+            round.seen = false;
+            return unseen;
+        }), enemyRounds.end());
 
-            unsigned opacity = 255;
-            if (cue.expires && cue.expires - now < FadeAfterDeathMs)
-                opacity = static_cast<unsigned>((cue.expires - now) * 255 / FadeAfterDeathMs);
-
+        const ULONGLONG now = GetTickCount64();
+        for (const auto& cue : frozenCues)
+        {
             float x, y;
-            if (ProjectAnchor(cue.anchor, viewport, x, y))
-                overlay.Draw(x, y, static_cast<float>(viewport.Height), cue.timing, true, opacity);
+            if (now >= cue.expires || !ProjectAnchor(cue.anchor, viewport, x, y))
+                continue;
+
+            overlay.Draw(x, y, viewport, cue.timing, cue.offset == 0, cue.style, cue.offset);
         }
+
+        // Keep suppressing the live cue for a resolved window even if its
+        // display time elapses before the animation advances to the next one.
+        frozenCues.erase(std::remove_if(frozenCues.begin(), frozenCues.end(), [now](const FrozenCue& cue)
+        {
+            return now >= cue.expires && chainCue.round != cue.round &&
+                   std::none_of(enemyRounds.begin(), enemyRounds.end(),
+                       [&cue](const EnemyRound& round) { return round.id == cue.round; });
+        }), frozenCues.end());
     }
 
     void DrawCues(IDirect3DDevice9* device)
@@ -1067,8 +1199,8 @@ namespace
         auto* player = GetActivePlayer();
         if (!player)
         {
-            heldCues = {};
-            missCue = {};
+            frozenCues.clear();
+            enemyRounds.clear();
             chainCue = {};
             return;
         }
@@ -1078,17 +1210,14 @@ namespace
         if (level >= ARRAYSIZE(DifficultyMasks) || FAILED(device->GetViewport(&viewport)))
             return;
 
-        const auto minimum = EffectiveMinimumFrames();
-        const auto* target = GetIssenTarget(player);
+        const auto minimum = settings.direct ? EffectiveMinimumFrames() : 0;
+        const auto* target = settings.direct ? GetIssenTarget(player) : nullptr;
         const EnemyNode* targetNode = nullptr;
-        const EnemyNode* missNode = nullptr;
         const auto mask = DifficultyMasks[level];
 
         Overlay overlay(device);
         for (auto* node = EnemyList(); node; node = node->next)
         {
-            if (node == missCue.node && node->actor == missCue.actor)
-                missNode = node;
             if (target && node->actor == target)
                 targetNode = node;
             else
@@ -1096,9 +1225,9 @@ namespace
         }
         if (targetNode)
             DrawEnemy(overlay, viewport, targetNode, mask, minimum, true);
-        DrawHeldCues(overlay, viewport);
-        DrawChainCue(overlay, viewport, player);
-        DrawMissCue(overlay, viewport, missNode);
+        if (settings.chain)
+            DrawChainCue(overlay, viewport, player);
+        DrawFrozenCues(overlay, viewport);
     }
 
     HRESULT WINAPI EndSceneWithCue(IDirect3DDevice9* device)
@@ -1183,6 +1312,9 @@ extern "C" __declspec(dllexport) void InitializeASI()
         std::memcmp(At(IssenCommit), CommitThunk, sizeof(CommitThunk)))
         return;
 
+    wchar_t iniPath[MAX_PATH];
+    if (SiblingIniPath(iniPath, L"Onimusha3.IssenCue.ini"))
+        settings = ReadCueSettings(iniPath);
     configuredMinimumFrames = ReadMinimumFrames();
     PrepareCircle();
 
@@ -1200,12 +1332,16 @@ extern "C" __declspec(dllexport) void InitializeASI()
     const auto commitCall = MakeCall(commitSite, reinterpret_cast<std::uintptr_t>(&CommitWithCue));
     BYTE* chainSetupSite = At(ChainSetupThunk);
     BYTE* playerTimerSite = At(PlayerTimerCallSite);
+    BYTE* chainInputSite = At(ChainInputCallSite);
+    nativeChainInput = At(NativeChainInput);
     auto chainSetupJump = MakeCall(chainSetupSite, reinterpret_cast<std::uintptr_t>(&SetupChainCue));
     chainSetupJump[0] = 0xe9;
     const auto playerTimerCall = MakeCall(playerTimerSite, reinterpret_cast<std::uintptr_t>(&UpdateChainCue));
-    const bool chainSupported =
+    const auto chainInputCall = MakeCall(chainInputSite, reinterpret_cast<std::uintptr_t>(&ChainInputWithCue));
+    const bool chainSupported = (settings.chain || (settings.chainMiss && settings.missFrames)) &&
         !std::memcmp(chainSetupSite, OriginalChainSetupThunk, sizeof(OriginalChainSetupThunk)) &&
-        !std::memcmp(playerTimerSite, OriginalPlayerTimerCall, sizeof(OriginalPlayerTimerCall));
+        !std::memcmp(playerTimerSite, OriginalPlayerTimerCall, sizeof(OriginalPlayerTimerCall)) &&
+        !std::memcmp(chainInputSite, OriginalChainInputCall, sizeof(OriginalChainInputCall));
 
     Patch patches[] = {
         {site, replacement, sizeof(replacement), 0},
@@ -1213,6 +1349,7 @@ extern "C" __declspec(dllexport) void InitializeASI()
         {commitSite, commitCall.data(), commitCall.size(), 0},
         {chainSetupSite, chainSetupJump.data(), chainSetupJump.size(), 0},
         {playerTimerSite, playerTimerCall.data(), playerTimerCall.size(), 0},
+        {chainInputSite, chainInputCall.data(), chainInputCall.size(), 0},
     };
     ApplyPatches(patches, chainSupported ? ARRAYSIZE(patches) : 3);
 }
