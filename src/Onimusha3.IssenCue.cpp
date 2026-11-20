@@ -1,6 +1,6 @@
 // Issen cue for the Simplified Chinese PC 1.0.0.1 release.
 // Build from an x86 Native Tools prompt:
-// cl /nologo /W4 /WX /O2 /MT /LD /std:c++17 /EHsc Onimusha3.IssenCue.cpp gdi32.lib /link /OUT:Onimusha3.IssenCue.asi
+// cl /nologo /W4 /WX /O2 /MT /LD /std:c++17 /EHsc Onimusha3.IssenCue.cpp /link /OUT:Onimusha3.IssenCue.asi
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 
 namespace
 {
@@ -21,23 +23,35 @@ namespace
     constexpr BYTE OriginalEndScene[] = {0x8b, 0x16, 0x8b, 0x82, 0xa8, 0, 0, 0, 0x56, 0xff, 0xd0};
     constexpr std::uintptr_t IssenSelector = 0x00407522;
     constexpr BYTE SelectorThunk[] = {0xe9, 0x09, 0x19, 0x41, 0};
+    constexpr std::uintptr_t CommitCallSite = 0x0081a6ce;
+    constexpr BYTE OriginalCommitCall[] = {0xe8, 0x6f, 0xea, 0xbe, 0xff};
+    constexpr std::uintptr_t IssenCommit = 0x00409142;
+    constexpr BYTE CommitThunk[] = {0xe9, 0x29, 0x4d, 0x41, 0};
     constexpr std::uintptr_t WorldToScreen = 0x00408e9f;
     constexpr BYTE ProjectionThunk[] = {0xe9, 0xec, 0x37, 0x42, 0};
 
     constexpr std::uintptr_t Player = 0x03caad40;
+    constexpr std::uintptr_t EnemyListHead = 0x04239810;
+    constexpr std::uintptr_t Difficulty = 0x03cb47c4;
+    constexpr std::uintptr_t IssenWindowSite = 0x00818e89;
+    constexpr std::uintptr_t BlendedMotionVtable = 0x0091ccf8;
     constexpr std::uintptr_t EnemyListCursor = 0x042398f0;
     constexpr std::uintptr_t GameFlags = 0x0418a10c;
     constexpr std::uintptr_t SkipFrame = 0x031b9bfe;
     constexpr std::uintptr_t WidescreenProjectionSite = 0x00433bca;
     constexpr std::uintptr_t DeviceSettings = 0x04260a0c;
 
-    constexpr int TextureSize = 128;
-    constexpr float CueHeightFraction = 0.11f;
     constexpr float EnemyHeight = 90.0f;
     constexpr float TallEnemyHeight = 170.0f;
+    constexpr ULONGLONG HoldAfterDeathMs = 3000;
+    constexpr ULONGLONG FadeAfterDeathMs = 180;
 
+    constexpr std::uint32_t DifficultyMasks[] = {0x00200000, 0x04000000, 0x00100000, 0x00100000};
+
+    HMODULE cueModule;
     BYTE* gameImage;
-    std::array<DWORD, TextureSize * TextureSize> cuePixels;
+    unsigned configuredMinimumFrames;
+    bool usesIssenWindow;
 
     BYTE* At(std::uintptr_t address)
     {
@@ -52,18 +66,24 @@ namespace
 
     using SelectIssen = BYTE* (__fastcall *)(BYTE* player, BYTE* result);
 
-    BYTE* GetIssenTarget()
+    BYTE* GetActivePlayer()
     {
         auto* player = At(Player);
         const BYTE character = player[2];
         const BYTE state = player[8]; // Normal gameplay uses actor state 1.
 
         // The original cue restricts this lookup to the playable characters.
-        // Honor the attack dispatcher's direct-Issen restrictions too.
-        if (*At(SkipFrame) || (*reinterpret_cast<const DWORD*>(At(GameFlags)) & 0x1000) ||
+        if ((*reinterpret_cast<const DWORD*>(At(GameFlags)) & 0x1000) ||
             character == 3 || character > 4 || state != 1 ||
-            !Field<void*>(player, 0x30) || Field<int>(player, 0x21e8) < 0 ||
-            (Field<DWORD>(player, 0x4444) & 0x40000) || (Field<DWORD>(player, 0x22f4) & 0x40000))
+            !Field<void*>(player, 0x30) || Field<int>(player, 0x21e8) < 0)
+            return nullptr;
+
+        return player;
+    }
+
+    const BYTE* GetIssenTarget(BYTE* player)
+    {
+        if ((Field<DWORD>(player, 0x4444) & 0x40000) || (Field<DWORD>(player, 0x22f4) & 0x40000))
             return nullptr;
 
         // This is the selector used by the attack and the orange haori. Its
@@ -74,6 +94,183 @@ namespace
         auto* enemy = reinterpret_cast<SelectIssen>(At(IssenSelector))(player, &result);
         cursor = savedCursor;
         return result != 0xfe ? enemy : nullptr;
+    }
+
+    unsigned ReadMinimumFrames()
+    {
+        wchar_t path[MAX_PATH];
+        const DWORD length = GetModuleFileNameW(cueModule, path, ARRAYSIZE(path));
+        if (!length || length >= ARRAYSIZE(path))
+            return 0;
+
+        auto* slash = std::wcsrchr(path, L'\\');
+        constexpr wchar_t ConfigName[] = L"Onimusha3.IssenWindow.ini";
+        if (!slash || ARRAYSIZE(path) - static_cast<std::size_t>(slash + 1 - path) < ARRAYSIZE(ConfigName))
+            return 0;
+        std::memcpy(slash + 1, ConfigName, sizeof(ConfigName));
+
+        wchar_t value[16];
+        const DWORD chars = GetPrivateProfileStringW(L"Issen", L"MinimumFrames", L"",
+                                                      value, ARRAYSIZE(value), path);
+        if (!chars || chars >= ARRAYSIZE(value) - 1)
+            return 0;
+        wchar_t* end = nullptr;
+        const long frames = std::wcstol(value, &end, 10);
+        return end != value && !*end && frames >= 2 && frames <= 255 ? static_cast<unsigned>(frames) : 0;
+    }
+
+    unsigned EffectiveMinimumFrames()
+    {
+        if (!configuredMinimumFrames || usesIssenWindow)
+            return configuredMinimumFrames;
+
+        // Test the installed jump, so ASI load order, a disabled patch, and
+        // an INI left behind after removal all give the correct baseline.
+        const BYTE* site = At(IssenWindowSite);
+        constexpr BYTE Padding[] = {0x90, 0x90, 0x90, 0x90, 0x90};
+        if (site[0] != 0xe9 || std::memcmp(site + 5, Padding, sizeof(Padding)))
+            return 0;
+
+        const auto windowModule = GetModuleHandleW(L"Onimusha3.IssenWindow.asi");
+        if (!windowModule)
+            return 0;
+        std::uintptr_t relative;
+        std::memcpy(&relative, site + 1, sizeof(relative));
+        const auto* destination = reinterpret_cast<const void*>(
+            reinterpret_cast<std::uintptr_t>(site + 5) + relative);
+        MEMORY_BASIC_INFORMATION region{};
+        usesIssenWindow = VirtualQuery(destination, &region, sizeof(region)) &&
+                          region.AllocationBase == windowModule;
+        return usesIssenWindow ? configuredMinimumFrames : 0;
+    }
+
+    struct MotionFrames
+    {
+        const std::uint32_t* flags;
+        unsigned count;
+        unsigned current;
+        float sample;
+    };
+
+    bool ReadMotion(const BYTE* enemy, MotionFrames& frames)
+    {
+        const auto* motion = Field<const BYTE*>(enemy, 0x30);
+        if (!motion)
+            return false;
+
+        const bool blended = Field<const void*>(motion, 0) == At(BlendedMotionVtable);
+        const unsigned channel = blended ? Field<BYTE>(motion, 0x1fc) : 0;
+        if (blended ? channel >= Field<BYTE>(motion, 0x1f8) : !Field<const void*>(motion, 0x94))
+            return false;
+
+        // The single player and the selected blend track share these fields.
+        const auto* flags = Field<const std::uint32_t*>(motion, 0xa4);
+        const unsigned current = Field<std::uint32_t>(motion, 0xc4);
+        const unsigned last = Field<std::uint16_t>(motion, 0xc8);
+        if (!flags || current > last)
+            return false;
+
+        float sample = static_cast<float>(current);
+        if (current == last)
+            sample = static_cast<float>(last + 1);
+        else if (blended)
+        {
+            // The source track stores eight fraction bits. Use them when the
+            // source still agrees with the index copied into the shared fields.
+            const auto* tracks = Field<const BYTE*>(motion, 0x1e0);
+            if (tracks)
+            {
+                const auto fixed = Field<std::uint32_t>(tracks + channel * 0x310, 0x2e0);
+                if ((fixed >> 8) == current)
+                    sample += static_cast<float>(fixed & 0xff) / 256.0f;
+            }
+        }
+        frames = {flags, last + 1, current, sample};
+        return true;
+    }
+
+    struct FrameWindow
+    {
+        unsigned begin;
+        unsigned end; // Exclusive.
+
+        explicit operator bool() const { return begin < end; }
+    };
+
+    FrameWindow NextWindow(const MotionFrames& frames, unsigned scan, std::uint32_t mask, unsigned minimum)
+    {
+        unsigned first = scan;
+        while (first < frames.count && !(frames.flags[first] & mask))
+            ++first;
+        unsigned end = first;
+        while (end < frames.count && (frames.flags[end] & mask))
+            ++end;
+        if (first == end)
+            return {first, end};
+
+        // IssenWindow extends each run back from its end. The previous run
+        // stops its lookahead, so an extension can only fill the preceding gap.
+        const unsigned earliest = end > minimum ? end - minimum : 0;
+        return {std::max(scan, std::min(first, earliest)), end};
+    }
+
+    struct RingTiming
+    {
+        float progress;
+        float opening;
+        float closing;
+        bool open;
+    };
+
+    bool CalculateTiming(const MotionFrames& frames, std::uint32_t mask, unsigned minimum, RingTiming& timing)
+    {
+        FrameWindow window = NextWindow(frames, 0, mask, minimum);
+        if (!window)
+            return false;
+
+        const float count = static_cast<float>(frames.count);
+        const float minimumSpan = count * 0.16f;
+        float extraTotal = 0.0f;
+        float extraElapsed = 0.0f;
+        float opening = 0.0f;
+        float closing = 0.0f;
+        FrameWindow selected{};
+
+        while (window)
+        {
+            auto next = NextWindow(frames, window.end, mask, minimum);
+            while (next && next.begin == window.end)
+            {
+                window.end = next.end;
+                next = NextWindow(frames, window.end, mask, minimum);
+            }
+
+            // Keep short windows legible. Stretch their part of the radial
+            // scale for the whole animation, so changing guide pairs never
+            // makes the moving ring jump outward.
+            const float begin = static_cast<float>(window.begin);
+            const float end = static_cast<float>(window.end);
+            const float span = end - begin;
+            const float extra = std::max(minimumSpan - span, 0.0f);
+            extraElapsed += extra * std::clamp((frames.sample - begin) / span, 0.0f, 1.0f);
+            if (frames.current >= selected.end)
+            {
+                selected = window;
+                opening = begin + extraTotal;
+                closing = end + extraTotal + extra;
+            }
+            extraTotal += extra;
+            window = next;
+        }
+
+        const float total = count + extraTotal;
+        timing = {
+            std::clamp((frames.sample + extraElapsed) / total, 0.0f, 1.0f),
+            opening / total,
+            closing / total,
+            frames.current >= selected.begin && frames.current < selected.end,
+        };
+        return true;
     }
 
     struct alignas(16) WorldPoint
@@ -88,12 +285,17 @@ namespace
 
     using ProjectPoint = int (__fastcall *)(ScreenPoint*, const WorldPoint*, float* inverseDepth);
 
-    bool ProjectEnemy(const BYTE* enemy, const D3DVIEWPORT9& viewport, float& x, float& y)
+    WorldPoint EnemyAnchor(const BYTE* enemy)
+    {
+        WorldPoint point = Field<WorldPoint>(enemy, 0x90);
+        point.y += enemy[2] == 0x34 ? TallEnemyHeight : EnemyHeight;
+        return point;
+    }
+
+    bool ProjectAnchor(const WorldPoint& position, const D3DVIEWPORT9& viewport, float& x, float& y)
     {
         // The game's own projection uses the current camera and rejects points
         // outside its clip volume. Its output is in 12.4 fixed-point GS units.
-        WorldPoint position = Field<WorldPoint>(enemy, 0x90);
-        position.y += enemy[2] == 0x34 ? TallEnemyHeight : EnemyHeight;
         ScreenPoint projected{};
         float inverseDepth = 0.0f;
         if (!reinterpret_cast<ProjectPoint>(At(WorldToScreen))(&projected, &position, &inverseDepth) ||
@@ -125,177 +327,144 @@ namespace
                y < static_cast<float>(viewport.Y + viewport.Height);
     }
 
-    using GlyphMask = std::array<BYTE, TextureSize * TextureSize>;
+    constexpr unsigned CircleSteps = 72;
+    constexpr unsigned StrokeLayers = 6;
+    constexpr float FullTurn = 6.28318530718f;
+    constexpr float MaxRadiusFraction = 0.061f;
+    constexpr float MinRadiusFraction = 0.014f;
 
-    bool ReadGlyph(HDC dc, const wchar_t* face, GlyphMask& mask)
+    struct UnitPoint { float x, y; };
+    std::array<UnitPoint, CircleSteps> circle;
+
+    constexpr auto MakeStrokeIndices()
     {
-        const HFONT font = CreateFontW(-94, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, GB2312_CHARSET,
-                                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                                       DEFAULT_PITCH, face);
-        if (!font)
-            return false;
-
-        const HGDIOBJ previous = SelectObject(dc, font);
-        constexpr wchar_t Letter[] = L"\u95ea";
-        const MAT2 identity = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
-        GLYPHMETRICS metrics{};
-        WORD glyph = 0xffff;
-        std::array<BYTE, TextureSize * TextureSize> bitmap;
-
-        DWORD bytes = GDI_ERROR;
-        if (previous && previous != HGDI_ERROR &&
-            GetGlyphIndicesW(dc, Letter, 1, &glyph, GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR &&
-            glyph != 0xffff)
+        std::array<WORD, CircleSteps * (StrokeLayers - 1) * 6> indices{};
+        unsigned index = 0;
+        for (unsigned step = 0; step < CircleSteps; ++step)
         {
-            bytes = GetGlyphOutlineW(dc, glyph, GGO_GRAY8_BITMAP | GGO_GLYPH_INDEX, &metrics,
-                                     static_cast<DWORD>(bitmap.size()), bitmap.data(), &identity);
-        }
-        if (previous && previous != HGDI_ERROR)
-            SelectObject(dc, previous);
-        DeleteObject(font);
-
-        constexpr UINT MaxGlyphExtent = TextureSize - 16;
-        if (!bytes || bytes == GDI_ERROR || !metrics.gmBlackBoxX || !metrics.gmBlackBoxY ||
-            metrics.gmBlackBoxX > MaxGlyphExtent || metrics.gmBlackBoxY > MaxGlyphExtent)
-            return false;
-
-        const UINT pitch = (metrics.gmBlackBoxX + 3u) & ~3u;
-        if (bytes < pitch * metrics.gmBlackBoxY)
-            return false;
-        const UINT left = (TextureSize - metrics.gmBlackBoxX) / 2;
-        const UINT top = (TextureSize - metrics.gmBlackBoxY) / 2;
-        for (UINT y = 0; y < metrics.gmBlackBoxY; ++y)
-        {
-            const auto* src = bitmap.data() + y * pitch;
-            auto* dst = mask.data() + (y + top) * TextureSize + left;
-            std::copy_n(src, metrics.gmBlackBoxX, dst);
-        }
-        return true;
-    }
-
-    struct Pixel
-    {
-        int r = 0;
-        int g = 0;
-        int b = 0;
-        int a = 0;
-
-        void Blend(int red, int green, int blue, int alpha)
-        {
-            const int rest = 255 - alpha;
-            r = (red * alpha + r * rest + 127) / 255;
-            g = (green * alpha + g * rest + 127) / 255;
-            b = (blue * alpha + b * rest + 127) / 255;
-            a = alpha + (a * rest + 127) / 255;
-        }
-
-        DWORD Argb() const
-        {
-            return D3DCOLOR_ARGB(a, r, g, b);
-        }
-    };
-
-    bool CreateCuePixels()
-    {
-        const HDC dc = CreateCompatibleDC(nullptr);
-        if (!dc)
-            return false;
-        GlyphMask mask{};
-        const bool found = ReadGlyph(dc, L"KaiTi", mask) || ReadGlyph(dc, L"Microsoft YaHei", mask) ||
-                           ReadGlyph(dc, L"SimHei", mask);
-        DeleteDC(dc);
-        if (!found)
-            return false;
-
-        for (int y = 7; y < TextureSize - 7; ++y)
-        {
-            for (int x = 7; x < TextureSize - 7; ++x)
+            const unsigned next = (step + 1) % CircleSteps;
+            for (unsigned layer = 0; layer + 1 < StrokeLayers; ++layer)
             {
-                int glow = 0;
-                int border = 0;
-                for (int dy = -7; dy <= 7; ++dy)
-                {
-                    for (int dx = -7; dx <= 7; ++dx)
-                    {
-                        const int distanceSquared = dx * dx + dy * dy;
-                        const int coverage = mask[(y + dy) * TextureSize + x + dx];
-                        if (distanceSquared <= 49)
-                            glow = std::max(glow, coverage * (49 - distanceSquared) * 160 / (64 * 49));
-                        if (distanceSquared <= 5)
-                            border = std::max(border, coverage * 235 / 64);
-                    }
-                }
-
-                const int index = y * TextureSize + x;
-                const int gold = std::clamp((y - 22) * 100 / 84, 0, 100);
-                Pixel pixel;
-                pixel.Blend(255, 102, 12, glow);
-                pixel.Blend(165, 57, 8, border);
-                pixel.Blend(255, 249 - gold / 2, 176 - gold, mask[index] * 255 / 64);
-                cuePixels[index] = pixel.Argb();
+                const auto a = static_cast<WORD>(step * StrokeLayers + layer);
+                const auto b = static_cast<WORD>(next * StrokeLayers + layer);
+                indices[index++] = a;
+                indices[index++] = b;
+                indices[index++] = a + 1;
+                indices[index++] = a + 1;
+                indices[index++] = b;
+                indices[index++] = b + 1;
             }
         }
-        return true;
+        return indices;
     }
 
-    IDirect3DTexture9* UploadCue(IDirect3DDevice9* device)
+    constexpr auto StrokeIndices = MakeStrokeIndices();
+
+    void PrepareCircle()
     {
-        IDirect3DTexture9* texture = nullptr;
-        // The texture lives only during this draw. It cannot retain the game's
-        // old device or obstruct a reset after switching display modes.
-        if (FAILED(device->CreateTexture(TextureSize, TextureSize, 1, 0, D3DFMT_A8R8G8B8,
-                                         D3DPOOL_MANAGED, &texture, nullptr)))
-            return nullptr;
-        D3DLOCKED_RECT locked{};
-        if (FAILED(texture->LockRect(0, &locked, nullptr, 0)))
+        for (unsigned step = 0; step < CircleSteps; ++step)
         {
-            texture->Release();
-            return nullptr;
+            const float angle = FullTurn * static_cast<float>(step) / CircleSteps;
+            circle[step] = {std::cos(angle), std::sin(angle)};
         }
-        auto* row = static_cast<BYTE*>(locked.pBits);
-        for (int y = 0; y < TextureSize; ++y, row += locked.Pitch)
-            std::memcpy(row, cuePixels.data() + y * TextureSize, TextureSize * sizeof(DWORD));
-        if (SUCCEEDED(texture->UnlockRect(0)))
-            return texture;
-
-        texture->Release();
-        return nullptr;
     }
 
-    void DrawCue(IDirect3DDevice9* device, float x, float y, float size)
+    D3DCOLOR ApplyOpacity(D3DCOLOR color, unsigned opacity)
     {
-        auto* texture = UploadCue(device);
-        if (!texture)
-            return;
+        return (color & 0x00ffffff) | (((color >> 24) * opacity / 255) << 24);
+    }
 
-        IDirect3DStateBlock9* state = nullptr;
-        if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &state)))
+    void DrawRing(IDirect3DDevice9* device, float x, float y, float radius,
+                  float width, float halo, D3DCOLOR lineColor, D3DCOLOR haloColor)
+    {
+        struct Vertex { float x, y, z, rhw; D3DCOLOR color; };
+
+        const float halfWidth = width * 0.5f;
+        const float offsets[] = {halfWidth + halo + 1.0f, halfWidth + halo, halfWidth,
+                                 -halfWidth, -halfWidth - halo, -halfWidth - halo - 1.0f};
+        const auto transparent = haloColor & 0x00ffffff;
+        const D3DCOLOR colors[] = {transparent, haloColor, lineColor, lineColor, haloColor, transparent};
+        std::array<Vertex, CircleSteps * StrokeLayers> vertices;
+        for (unsigned step = 0; step < CircleSteps; ++step)
         {
-            // The game uses a state cache. Restore the device to what the cache
-            // expects before returning to its EndScene and next frame.
+            for (unsigned layer = 0; layer < StrokeLayers; ++layer)
+            {
+                const float distance = radius + offsets[layer];
+                vertices[step * StrokeLayers + layer] = {
+                    x + circle[step].x * distance - 0.5f,
+                    y + circle[step].y * distance - 0.5f,
+                    0.0f, 1.0f, colors[layer],
+                };
+            }
+        }
+        device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, static_cast<UINT>(vertices.size()),
+                                       static_cast<UINT>(StrokeIndices.size() / 3),
+                                       StrokeIndices.data(), D3DFMT_INDEX16,
+                                       vertices.data(), sizeof(Vertex));
+    }
+
+    class Overlay
+    {
+    public:
+        explicit Overlay(IDirect3DDevice9* device) : device(device) {}
+
+        ~Overlay()
+        {
+            if (state)
+            {
+                state->Apply();
+                state->Release();
+            }
+        }
+
+        Overlay(const Overlay&) = delete;
+        Overlay& operator=(const Overlay&) = delete;
+
+        void Draw(float x, float y, float height, const RingTiming& timing, bool accepted, unsigned opacity = 255)
+        {
+            if (!state && !Begin())
+                return;
+
+            const float outer = std::max(10.0f, height * MaxRadiusFraction);
+            const float inner = std::max(5.0f, height * MinRadiusFraction);
+            const auto radius = [=](float progress) { return outer - (outer - inner) * progress; };
+            const float scale = std::max(0.75f, height / 900.0f);
+
+            // The opening and closing guide strokes remain fixed during each
+            // window. The heavier moving stroke reads on both light and dark terrain.
+            const auto guide = ApplyOpacity(0xceeee5ca, opacity);
+            const auto guideHalo = ApplyOpacity(0x800e0e12, opacity);
+            DrawRing(device, x, y, radius(timing.opening), 1.05f * scale, 0.65f * scale, guide, guideHalo);
+            DrawRing(device, x, y, radius(timing.closing), 1.05f * scale, 0.65f * scale, guide, guideHalo);
+            DrawRing(device, x, y, radius(timing.progress), 2.15f * scale, 1.10f * scale,
+                      ApplyOpacity(accepted ? 0xffffd05a : 0xf2fff3d5, opacity),
+                      ApplyOpacity(accepted ? 0xdc9a4505 : 0xbc151319, opacity));
+        }
+
+    private:
+        bool Begin()
+        {
+            if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &state)))
+                return false;
+
+            // The game caches device state. Restore all the state changed by
+            // this untextured overlay before handing the D3D9 scene back.
             device->SetVertexShader(nullptr);
             device->SetPixelShader(nullptr);
-            device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-            device->SetTexture(0, texture);
+            device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+            device->SetTexture(0, nullptr);
             device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
             device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
-            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
             device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-            device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-            device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
             device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
             device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
             device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
             device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
             device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
             device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+            device->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
             device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
             device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
             device->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0f);
@@ -303,33 +472,211 @@ namespace
             device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
             device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
             device->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
-            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
             device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-
-            struct Vertex { float x, y, z, rhw, u, v; };
-            const float left = x - size * 0.5f - 0.5f;
-            const float top = y - size * 0.5f - 0.5f;
-            const Vertex quad[] = {
-                {left,        top,        0.0f, 1.0f, 0.0f, 0.0f},
-                {left + size, top,        0.0f, 1.0f, 1.0f, 0.0f},
-                {left,        top + size, 0.0f, 1.0f, 0.0f, 1.0f},
-                {left + size, top + size, 0.0f, 1.0f, 1.0f, 1.0f},
-            };
-            device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex));
-            state->Apply();
-            state->Release();
+            return true;
         }
-        texture->Release();
+
+        IDirect3DDevice9* device;
+        IDirect3DStateBlock9* state = nullptr;
+    };
+
+    // The selector scans the type-2 actor list. Walking the same list provides
+    // upcoming windows even when a timing query has no valid target yet.
+    struct EnemyNode
+    {
+        const EnemyNode* next;
+        const BYTE* actor;
+    };
+
+    const EnemyNode* EnemyList()
+    {
+        return *reinterpret_cast<const EnemyNode* const*>(At(EnemyListHead));
+    }
+
+    struct HeldCue
+    {
+        const EnemyNode* node;
+        const BYTE* actor;
+        const std::uint32_t* attackFlags;
+        unsigned lastFrame;
+        RingTiming timing;
+        WorldPoint anchor;
+        ULONGLONG expires;
+        bool onOriginalAttack;
+        bool seenAlive;
+    };
+
+    std::array<HeldCue, 32> heldCues;
+
+    HeldCue* FindLiveCue(const EnemyNode* node)
+    {
+        for (auto& cue : heldCues)
+        {
+            if (cue.node == node && cue.actor == node->actor && !cue.expires)
+                return &cue;
+        }
+        return nullptr;
+    }
+
+    void HoldCue(const BYTE* enemy)
+    {
+        if (!enemy)
+            return;
+
+        const unsigned level = *At(Difficulty);
+        MotionFrames frames{};
+        RingTiming timing{};
+        if (level >= ARRAYSIZE(DifficultyMasks) || !ReadMotion(enemy, frames) ||
+            !CalculateTiming(frames, DifficultyMasks[level], EffectiveMinimumFrames(), timing))
+            return;
+
+        auto* node = EnemyList();
+        while (node && node->actor != enemy)
+            node = node->next;
+        if (!node)
+            return;
+
+        auto* cue = FindLiveCue(node);
+        if (!cue)
+        {
+            // Free slots precede expired cues. Keep every live cue unless the
+            // fixed storage is full and the game has no expired cue to reuse.
+            const auto slot = std::min_element(heldCues.begin(), heldCues.end(),
+                [](const HeldCue& left, const HeldCue& right) {
+                    const ULONGLONG live = ~ULONGLONG{0};
+                    const auto priority = [=](const HeldCue& entry) {
+                        return !entry.node ? ULONGLONG{0} : entry.expires ? entry.expires : live;
+                    };
+                    return priority(left) < priority(right);
+                });
+            if (slot->node && !slot->expires)
+                return;
+            cue = &*slot;
+        }
+        *cue = {node, enemy, frames.flags, frames.current, timing, EnemyAnchor(enemy), 0, true, false};
+    }
+
+    int __fastcall CommitWithCue(BYTE* player)
+    {
+        using Commit = int (__thiscall *)(BYTE*);
+        const int result = reinterpret_cast<Commit>(At(IssenCommit))(player);
+        // The preceding native call stored the selected victim at +2254.
+        // This call succeeds only when the attack dispatcher commits to Issen.
+        if (result && player == At(Player))
+            HoldCue(Field<const BYTE*>(player, 0x2254));
+        return result;
+    }
+
+    bool TrackHeldCue(const EnemyNode* node, const MotionFrames& frames, bool timedAttack)
+    {
+        auto* cue = FindLiveCue(node);
+        if (!cue)
+            return false;
+
+        const bool sameAttack = cue->onOriginalAttack && frames.flags == cue->attackFlags &&
+                                frames.current >= cue->lastFrame;
+        if (timedAttack && !sameAttack)
+        {
+            *cue = {};
+            return false;
+        }
+
+        // Idle and hit reactions leave the frozen radius intact. A restart
+        // on the same animation table counts as a new attack when it wraps.
+        cue->onOriginalAttack = sameAttack;
+        cue->lastFrame = frames.current;
+        cue->anchor = EnemyAnchor(node->actor);
+        cue->seenAlive = true;
+        return true;
+    }
+
+    void DrawEnemy(Overlay& overlay, const D3DVIEWPORT9& viewport, const EnemyNode* node,
+                   std::uint32_t mask, unsigned minimum, bool selected)
+    {
+        const auto* enemy = node->actor;
+        if (!enemy || Field<int>(enemy, 0x21e8) <= 0)
+            return;
+
+        MotionFrames frames{};
+        RingTiming timing{};
+        const bool timedAttack = ReadMotion(enemy, frames) && CalculateTiming(frames, mask, minimum, timing);
+        if (TrackHeldCue(node, frames, timedAttack) || !timedAttack ||
+            !enemy[0xef] || !(enemy[0x0a] & 4))
+            return;
+
+        float x, y;
+        const auto anchor = EnemyAnchor(enemy);
+        if (ProjectAnchor(anchor, viewport, x, y))
+            overlay.Draw(x, y, static_cast<float>(viewport.Height), timing, selected && timing.open);
+    }
+
+    void DrawHeldCues(Overlay& overlay, const D3DVIEWPORT9& viewport)
+    {
+        const ULONGLONG now = GetTickCount64();
+        for (auto& cue : heldCues)
+        {
+            if (!cue.node)
+                continue;
+            // A missing actor can already have been freed. Keep the last
+            // world position without accessing the stored actor or node.
+            if (!cue.seenAlive && !cue.expires)
+                cue.expires = now + HoldAfterDeathMs;
+            cue.seenAlive = false;
+            if (cue.expires && now >= cue.expires)
+            {
+                cue = {};
+                continue;
+            }
+
+            unsigned opacity = 255;
+            if (cue.expires && cue.expires - now < FadeAfterDeathMs)
+                opacity = static_cast<unsigned>((cue.expires - now) * 255 / FadeAfterDeathMs);
+
+            float x, y;
+            if (ProjectAnchor(cue.anchor, viewport, x, y))
+                overlay.Draw(x, y, static_cast<float>(viewport.Height), cue.timing, true, opacity);
+        }
+    }
+
+    void DrawCues(IDirect3DDevice9* device)
+    {
+        if (*At(SkipFrame))
+            return;
+
+        auto* player = GetActivePlayer();
+        if (!player)
+        {
+            heldCues = {};
+            return;
+        }
+
+        const unsigned level = *At(Difficulty);
+        D3DVIEWPORT9 viewport{};
+        if (level >= ARRAYSIZE(DifficultyMasks) || FAILED(device->GetViewport(&viewport)))
+            return;
+
+        const auto minimum = EffectiveMinimumFrames();
+        const auto* target = GetIssenTarget(player);
+        const EnemyNode* targetNode = nullptr;
+        const auto mask = DifficultyMasks[level];
+
+        Overlay overlay(device);
+        for (auto* node = EnemyList(); node; node = node->next)
+        {
+            if (target && node->actor == target)
+                targetNode = node;
+            else
+                DrawEnemy(overlay, viewport, node, mask, minimum, false);
+        }
+        if (targetNode)
+            DrawEnemy(overlay, viewport, targetNode, mask, minimum, true);
+        DrawHeldCues(overlay, viewport);
     }
 
     HRESULT WINAPI EndSceneWithCue(IDirect3DDevice9* device)
     {
-        const auto* target = GetIssenTarget();
-        D3DVIEWPORT9 viewport{};
-        float x, y;
-        if (target && SUCCEEDED(device->GetViewport(&viewport)) && ProjectEnemy(target, viewport, x, y))
-            DrawCue(device, x, y, static_cast<float>(viewport.Height) * CueHeightFraction);
-
+        DrawCues(device);
         return device->EndScene();
     }
 
@@ -359,8 +706,12 @@ extern "C" __declspec(dllexport) void InitializeASI()
     if (std::memcmp(site, OriginalEndScene, sizeof(OriginalEndScene)) ||
         std::memcmp(At(IssenSelector), SelectorThunk, sizeof(SelectorThunk)) ||
         std::memcmp(At(WorldToScreen), ProjectionThunk, sizeof(ProjectionThunk)) ||
-        !CreateCuePixels())
+        std::memcmp(At(CommitCallSite), OriginalCommitCall, sizeof(OriginalCommitCall)) ||
+        std::memcmp(At(IssenCommit), CommitThunk, sizeof(CommitThunk)))
         return;
+
+    configuredMinimumFrames = ReadMinimumFrames();
+    PrepareCircle();
 
     // Replace the game's final COM call with an ABI-compatible call that draws
     // first and returns the original HRESULT. ESI holds the device at this site.
@@ -373,12 +724,33 @@ extern "C" __declspec(dllexport) void InitializeASI()
     static_assert(sizeof(relative) == 4, "Build this ASI for x86.");
     std::memcpy(replacement + 2, &relative, sizeof(relative));
 
-    DWORD oldProtection = 0;
-    if (!VirtualProtect(site, sizeof(replacement), PAGE_EXECUTE_READWRITE, &oldProtection))
+    // Replace only the call made by the direct-Issen input dispatcher.
+    BYTE* commitSite = At(CommitCallSite);
+    BYTE commitReplacement[sizeof(OriginalCommitCall)] = {0xe8};
+    const auto commitRelative = reinterpret_cast<std::uintptr_t>(&CommitWithCue) -
+                                reinterpret_cast<std::uintptr_t>(commitSite + sizeof(commitReplacement));
+    std::memcpy(commitReplacement + 1, &commitRelative, sizeof(commitRelative));
+
+    DWORD renderProtection = 0;
+    if (!VirtualProtect(site, sizeof(replacement), PAGE_EXECUTE_READWRITE, &renderProtection))
         return;
-    std::memcpy(site, replacement, sizeof(replacement));
-    FlushInstructionCache(GetCurrentProcess(), site, sizeof(replacement));
+
+    DWORD commitProtection = 0;
     DWORD unused = 0;
-    VirtualProtect(site, sizeof(replacement), oldProtection, &unused);
+    if (VirtualProtect(commitSite, sizeof(commitReplacement), PAGE_EXECUTE_READWRITE, &commitProtection))
+    {
+        std::memcpy(site, replacement, sizeof(replacement));
+        std::memcpy(commitSite, commitReplacement, sizeof(commitReplacement));
+        FlushInstructionCache(GetCurrentProcess(), site, sizeof(replacement));
+        FlushInstructionCache(GetCurrentProcess(), commitSite, sizeof(commitReplacement));
+        VirtualProtect(commitSite, sizeof(commitReplacement), commitProtection, &unused);
+    }
+    VirtualProtect(site, sizeof(replacement), renderProtection, &unused);
 }
 
+BOOL WINAPI DllMain(HMODULE instance, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+        cueModule = instance;
+    return TRUE;
+}
