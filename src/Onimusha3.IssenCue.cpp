@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 
@@ -23,6 +24,8 @@ namespace
     constexpr BYTE OriginalEndScene[] = {0x8b, 0x16, 0x8b, 0x82, 0xa8, 0, 0, 0, 0x56, 0xff, 0xd0};
     constexpr std::uintptr_t IssenSelector = 0x00407522;
     constexpr BYTE SelectorThunk[] = {0xe9, 0x09, 0x19, 0x41, 0};
+    constexpr std::uintptr_t InputSelectCallSite = 0x0081a6b4;
+    constexpr BYTE OriginalInputSelectCall[] = {0xe8, 0x69, 0xce, 0xbe, 0xff};
     constexpr std::uintptr_t CommitCallSite = 0x0081a6ce;
     constexpr BYTE OriginalCommitCall[] = {0xe8, 0x6f, 0xea, 0xbe, 0xff};
     constexpr std::uintptr_t IssenCommit = 0x00409142;
@@ -45,6 +48,8 @@ namespace
     constexpr float TallEnemyHeight = 170.0f;
     constexpr ULONGLONG HoldAfterDeathMs = 3000;
     constexpr ULONGLONG FadeAfterDeathMs = 180;
+    constexpr int MaxMissFrames = 5;
+    constexpr ULONGLONG MissCueMs = 1800;
 
     constexpr std::uint32_t DifficultyMasks[] = {0x00200000, 0x04000000, 0x00100000, 0x00100000};
 
@@ -222,19 +227,24 @@ namespace
         bool open;
     };
 
-    bool CalculateTiming(const MotionFrames& frames, std::uint32_t mask, unsigned minimum, RingTiming& timing)
+    int OffsetFromWindow(unsigned current, FrameWindow window)
+    {
+        if (current < window.begin)
+            return static_cast<int>(current) - static_cast<int>(window.begin);
+        if (current >= window.end)
+            return static_cast<int>(current) - static_cast<int>(window.end - 1);
+        return 0;
+    }
+
+    bool CalculateTiming(const MotionFrames& frames, std::uint32_t mask, unsigned minimum,
+                         RingTiming& timing, int* nearestOffset = nullptr)
     {
         FrameWindow window = NextWindow(frames, 0, mask, minimum);
         if (!window)
             return false;
 
-        const float count = static_cast<float>(frames.count);
-        const float minimumSpan = count * 0.16f;
-        float extraTotal = 0.0f;
-        float extraElapsed = 0.0f;
-        float opening = 0.0f;
-        float closing = 0.0f;
         FrameWindow selected{};
+        int selectedOffset = 0;
 
         while (window)
         {
@@ -245,31 +255,28 @@ namespace
                 next = NextWindow(frames, window.end, mask, minimum);
             }
 
-            // Keep short windows legible. Stretch their part of the radial
-            // scale for the whole animation, so changing guide pairs never
-            // makes the moving ring jump outward.
-            const float begin = static_cast<float>(window.begin);
-            const float end = static_cast<float>(window.end);
-            const float span = end - begin;
-            const float extra = std::max(minimumSpan - span, 0.0f);
-            extraElapsed += extra * std::clamp((frames.sample - begin) / span, 0.0f, 1.0f);
-            if (frames.current >= selected.end)
+            const int offset = OffsetFromWindow(frames.current, window);
+            const bool selectWindow = nearestOffset
+                ? !selected || std::abs(offset) <= std::abs(selectedOffset)
+                : frames.current >= selected.end;
+            if (selectWindow)
             {
                 selected = window;
-                opening = begin + extraTotal;
-                closing = end + extraTotal + extra;
+                selectedOffset = offset;
             }
-            extraTotal += extra;
             window = next;
         }
 
-        const float total = count + extraTotal;
+        // Animation and window edges use the same linear radial scale.
+        const float count = static_cast<float>(frames.count);
         timing = {
-            std::clamp((frames.sample + extraElapsed) / total, 0.0f, 1.0f),
-            opening / total,
-            closing / total,
-            frames.current >= selected.begin && frames.current < selected.end,
+            std::clamp(frames.sample / count, 0.0f, 1.0f),
+            static_cast<float>(selected.begin) / count,
+            static_cast<float>(selected.end) / count,
+            selectedOffset == 0,
         };
+        if (nearestOffset)
+            *nearestOffset = selectedOffset;
         return true;
     }
 
@@ -329,19 +336,25 @@ namespace
 
     constexpr unsigned CircleSteps = 72;
     constexpr unsigned StrokeLayers = 6;
+    constexpr unsigned DashPeriod = 6;
+    constexpr unsigned VisibleDashSteps = 4;
     constexpr float FullTurn = 6.28318530718f;
-    constexpr float MaxRadiusFraction = 0.061f;
+    constexpr float MaxRadiusFraction = 0.122f;
     constexpr float MinRadiusFraction = 0.014f;
 
     struct UnitPoint { float x, y; };
     std::array<UnitPoint, CircleSteps> circle;
 
+    template<bool Dashed>
     constexpr auto MakeStrokeIndices()
     {
-        std::array<WORD, CircleSteps * (StrokeLayers - 1) * 6> indices{};
+        constexpr unsigned steps = Dashed ? CircleSteps / DashPeriod * VisibleDashSteps : CircleSteps;
+        std::array<WORD, steps * (StrokeLayers - 1) * 6> indices{};
         unsigned index = 0;
         for (unsigned step = 0; step < CircleSteps; ++step)
         {
+            if (Dashed && step % DashPeriod >= VisibleDashSteps)
+                continue;
             const unsigned next = (step + 1) % CircleSteps;
             for (unsigned layer = 0; layer + 1 < StrokeLayers; ++layer)
             {
@@ -358,7 +371,17 @@ namespace
         return indices;
     }
 
-    constexpr auto StrokeIndices = MakeStrokeIndices();
+    constexpr auto StrokeIndices = MakeStrokeIndices<false>();
+    constexpr auto DashedStrokeIndices = MakeStrokeIndices<true>();
+
+    float CueRadius(float height, float progress)
+    {
+        const float outer = std::max(20.0f, height * MaxRadiusFraction);
+        const float inner = std::max(5.0f, height * MinRadiusFraction);
+        return outer - (outer - inner) * progress;
+    }
+
+    struct Vertex { float x, y, z, rhw; D3DCOLOR color; };
 
     void PrepareCircle()
     {
@@ -374,22 +397,16 @@ namespace
         return (color & 0x00ffffff) | (((color >> 24) * opacity / 255) << 24);
     }
 
-    void DrawRing(IDirect3DDevice9* device, float x, float y, float radius,
-                  float width, float halo, D3DCOLOR lineColor, D3DCOLOR haloColor)
+    void DrawRingMesh(IDirect3DDevice9* device, float x, float y,
+                      const float (&radii)[StrokeLayers], const D3DCOLOR (&colors)[StrokeLayers],
+                      bool dashed = false)
     {
-        struct Vertex { float x, y, z, rhw; D3DCOLOR color; };
-
-        const float halfWidth = width * 0.5f;
-        const float offsets[] = {halfWidth + halo + 1.0f, halfWidth + halo, halfWidth,
-                                 -halfWidth, -halfWidth - halo, -halfWidth - halo - 1.0f};
-        const auto transparent = haloColor & 0x00ffffff;
-        const D3DCOLOR colors[] = {transparent, haloColor, lineColor, lineColor, haloColor, transparent};
         std::array<Vertex, CircleSteps * StrokeLayers> vertices;
         for (unsigned step = 0; step < CircleSteps; ++step)
         {
             for (unsigned layer = 0; layer < StrokeLayers; ++layer)
             {
-                const float distance = radius + offsets[layer];
+                const float distance = radii[layer];
                 vertices[step * StrokeLayers + layer] = {
                     x + circle[step].x * distance - 0.5f,
                     y + circle[step].y * distance - 0.5f,
@@ -397,10 +414,86 @@ namespace
                 };
             }
         }
+        const auto* indices = dashed ? DashedStrokeIndices.data() : StrokeIndices.data();
+        const auto count = dashed ? DashedStrokeIndices.size() : StrokeIndices.size();
         device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, static_cast<UINT>(vertices.size()),
-                                       static_cast<UINT>(StrokeIndices.size() / 3),
-                                       StrokeIndices.data(), D3DFMT_INDEX16,
+                                       static_cast<UINT>(count / 3), indices, D3DFMT_INDEX16,
                                        vertices.data(), sizeof(Vertex));
+    }
+
+    void DrawRing(IDirect3DDevice9* device, float x, float y, float radius,
+                  float width, float halo, D3DCOLOR lineColor, D3DCOLOR haloColor, bool dashed = false)
+    {
+        const float outer = radius + width * 0.5f;
+        const float inner = radius - width * 0.5f;
+        const float radii[] = {outer + halo + 1.0f, outer + halo, outer,
+                               inner, inner - halo, inner - halo - 1.0f};
+        const auto transparent = haloColor & 0x00ffffff;
+        const D3DCOLOR colors[] = {transparent, haloColor, lineColor, lineColor, haloColor, transparent};
+        DrawRingMesh(device, x, y, radii, colors, dashed);
+    }
+
+    void DrawWindowBand(IDirect3DDevice9* device, float x, float y, float outer, float inner,
+                        float scale, bool accepted, unsigned opacity)
+    {
+        // Keep the brighter edges completely inside the two frame boundaries.
+        const float edgeWidth = std::min(0.8f * scale, (outer - inner) * 0.25f);
+        const float radii[] = {outer, outer - edgeWidth * 0.5f, outer - edgeWidth,
+                               inner + edgeWidth, inner + edgeWidth * 0.5f, inner};
+        const auto edge = ApplyOpacity(accepted ? 0xdfffe29b : 0xb4ffdca4, opacity);
+        const auto fill = ApplyOpacity(accepted ? 0x84ffd05a : 0x67e8b25e, opacity);
+        const D3DCOLOR colors[] = {edge, edge, fill, fill, edge, edge};
+        DrawRingMesh(device, x, y, radii, colors);
+    }
+
+    void DrawFrameOffset(IDirect3DDevice9* device, float x, float y, float scale,
+                         int offset, D3DCOLOR color, unsigned opacity)
+    {
+        // A five-pixel-high bitmap font keeps this small label independent of
+        // fonts and textures. The only supported magnitudes are 1 through 5.
+        constexpr char Glyphs[][16] = {
+            ".#." "##." ".#." ".#." "###",
+            "###" "..#" "###" "#.." "###",
+            "###" "..#" "###" "..#" "###",
+            "#.#" "#.#" "###" "..#" "..#",
+            "###" "#.." "###" "..#" "###",
+            "..." "..." "###" "..." "...",
+            "..." ".#." "###" ".#." "...",
+        };
+        static_assert(MaxMissFrames == 5);
+        const char* glyphs[] = {Glyphs[offset < 0 ? 5 : 6], Glyphs[std::abs(offset) - 1]};
+        const float pixel = std::max(1.25f, 1.8f * scale);
+        const float left = std::floor(x - 3.5f * pixel);
+        const float top = std::floor(y);
+        std::array<Vertex, (1 + 2 * 15) * 6> vertices;
+        unsigned count = 0;
+        const auto rectangle = [&](float x0, float y0, float x1, float y1, D3DCOLOR fill)
+        {
+            const Vertex a{x0 - 0.5f, y0 - 0.5f, 0.0f, 1.0f, fill};
+            const Vertex b{x1 - 0.5f, y0 - 0.5f, 0.0f, 1.0f, fill};
+            const Vertex c{x0 - 0.5f, y1 - 0.5f, 0.0f, 1.0f, fill};
+            const Vertex d{x1 - 0.5f, y1 - 0.5f, 0.0f, 1.0f, fill};
+            for (const auto& v : {a, b, c, c, b, d})
+                vertices[count++] = v;
+        };
+        rectangle(left - 2.0f * pixel, top - pixel, left + 9.0f * pixel, top + 6.0f * pixel,
+                  ApplyOpacity(0xd912191f, opacity));
+        for (unsigned glyph = 0; glyph < ARRAYSIZE(glyphs); ++glyph)
+        {
+            for (unsigned row = 0; row < 5; ++row)
+            {
+                for (unsigned column = 0; column < 3; ++column)
+                {
+                    if (glyphs[glyph][3 * row + column] == '#')
+                    {
+                        const float x0 = left + static_cast<float>(4 * glyph + column) * pixel;
+                        const float y0 = top + static_cast<float>(row) * pixel;
+                        rectangle(x0, y0, x0 + pixel, y0 + pixel, color);
+                    }
+                }
+            }
+        }
+        device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, count / 3, vertices.data(), sizeof(Vertex));
     }
 
     class Overlay
@@ -425,20 +518,36 @@ namespace
             if (!state && !Begin())
                 return;
 
-            const float outer = std::max(10.0f, height * MaxRadiusFraction);
-            const float inner = std::max(5.0f, height * MinRadiusFraction);
-            const auto radius = [=](float progress) { return outer - (outer - inner) * progress; };
             const float scale = std::max(0.75f, height / 900.0f);
 
-            // The opening and closing guide strokes remain fixed during each
-            // window. The heavier moving stroke reads on both light and dark terrain.
-            const auto guide = ApplyOpacity(0xceeee5ca, opacity);
-            const auto guideHalo = ApplyOpacity(0x800e0e12, opacity);
-            DrawRing(device, x, y, radius(timing.opening), 1.05f * scale, 0.65f * scale, guide, guideHalo);
-            DrawRing(device, x, y, radius(timing.closing), 1.05f * scale, 0.65f * scale, guide, guideHalo);
-            DrawRing(device, x, y, radius(timing.progress), 2.15f * scale, 1.10f * scale,
+            DrawWindowBand(device, x, y, CueRadius(height, timing.opening),
+                           CueRadius(height, timing.closing), scale, accepted, opacity);
+            DrawRing(device, x, y, CueRadius(height, timing.progress), 2.15f * scale, 1.10f * scale,
                       ApplyOpacity(accepted ? 0xffffd05a : 0xf2fff3d5, opacity),
                       ApplyOpacity(accepted ? 0xdc9a4505 : 0xbc151319, opacity));
+        }
+
+        void DrawMiss(float x, float y, const D3DVIEWPORT9& viewport,
+                      float progress, int offset, unsigned opacity)
+        {
+            if (!state && !Begin())
+                return;
+
+            const float height = static_cast<float>(viewport.Height);
+            const float scale = std::max(0.75f, height / 900.0f);
+            const float radius = CueRadius(height, progress);
+            const auto color = ApplyOpacity(offset < 0 ? 0xff78e7fa : 0xffff967b, opacity);
+            DrawRing(device, x, y, radius, 1.2f * scale, 0.65f * scale, color,
+                     ApplyOpacity(0xd812191f, opacity), true);
+
+            const float pixel = std::max(1.25f, 1.8f * scale);
+            const float left = static_cast<float>(viewport.X);
+            const float top = static_cast<float>(viewport.Y);
+            const float right = left + static_cast<float>(viewport.Width);
+            const float bottom = top + height;
+            const float labelX = std::clamp(x + radius * 0.73f, left + 6.0f * pixel, right - 6.0f * pixel);
+            const float labelY = std::clamp(y - radius * 0.73f - 5.0f * pixel, top + pixel, bottom - 6.0f * pixel);
+            DrawFrameOffset(device, labelX, labelY, scale, offset, color, opacity);
         }
 
     private:
@@ -492,6 +601,123 @@ namespace
     const EnemyNode* EnemyList()
     {
         return *reinterpret_cast<const EnemyNode* const*>(At(EnemyListHead));
+    }
+
+    struct MissCue
+    {
+        const EnemyNode* node;
+        const BYTE* actor;
+        float progress;
+        int offset;
+        ULONGLONG expires;
+    };
+
+    MissCue missCue;
+
+    bool HasIssenHitTarget(const BYTE* enemy)
+    {
+        // After selection the input dispatcher requires an active target
+        // and a hit region with one of these flags before it can commit.
+        if (!enemy || enemy[8] != 1 || !enemy[0xef] || !(enemy[0x0a] & 4) ||
+            Field<int>(enemy, 0x21e8) <= 0)
+            return false;
+
+        const unsigned count = Field<BYTE>(enemy, 0x108);
+        for (unsigned index = 0; index < count; ++index)
+        {
+            const auto* region = Field<const BYTE*>(enemy, 0x110 + 4 * index);
+            if (region && (Field<DWORD>(region, 4) & 0xf0000000))
+                return true;
+        }
+        return false;
+    }
+
+    void RecordNearMiss(BYTE* player)
+    {
+        const unsigned level = *At(Difficulty);
+        if (level >= ARRAYSIZE(DifficultyMasks) || player != GetActivePlayer() ||
+            (Field<DWORD>(player, 0x22f4) & 0x40000))
+            return;
+
+        const auto mask = DifficultyMasks[level];
+        const auto minimum = EffectiveMinimumFrames();
+        struct Candidate
+        {
+            const EnemyNode* node;
+            std::uint32_t* activeFlags;
+            float progress;
+            int offset;
+        };
+        std::array<Candidate, 32> candidates;
+        unsigned count = 0;
+
+        for (auto* node = EnemyList(); node && count < candidates.size(); node = node->next)
+        {
+            const auto* enemy = node->actor;
+            MotionFrames frames{};
+            RingTiming timing{};
+            int offset = 0;
+            if (!HasIssenHitTarget(enemy) || !ReadMotion(enemy, frames) ||
+                !CalculateTiming(frames, mask, minimum, timing, &offset) ||
+                !offset || std::abs(offset) > MaxMissFrames)
+                continue;
+
+            auto* motion = Field<BYTE*>(enemy, 0x30);
+            auto* activeFlags = reinterpret_cast<std::uint32_t*>(motion + 0xb4);
+            if (!(*activeFlags & mask))
+                candidates[count++] = {node, activeFlags, timing.progress, offset};
+        }
+
+        if (!count)
+            return;
+
+        // The actual input has already failed. For this separate query only,
+        // give near-window candidates the timing bit so the original selector
+        // can apply the game's distance, facing, lock-on and enemy checks.
+        // The temporary bit is always removed before returning the real result.
+        for (unsigned index = 0; index < count; ++index)
+            *candidates[index].activeFlags |= mask;
+        const auto* candidate = GetIssenTarget(player);
+        for (unsigned index = 0; index < count; ++index)
+            *candidates[index].activeFlags &= ~mask;
+
+        for (unsigned index = 0; index < count; ++index)
+        {
+            const auto& entry = candidates[index];
+            if (entry.node->actor == candidate)
+            {
+                missCue = {entry.node, candidate, entry.progress, entry.offset, GetTickCount64() + MissCueMs};
+                return;
+            }
+        }
+    }
+
+    BYTE* __fastcall SelectFromInput(BYTE* player, BYTE* result)
+    {
+        auto* target = reinterpret_cast<SelectIssen>(At(IssenSelector))(player, result);
+        if (!target)
+            RecordNearMiss(player);
+        return target;
+    }
+
+    void DrawMissCue(Overlay& overlay, const D3DVIEWPORT9& viewport, const EnemyNode* node)
+    {
+        if (!missCue.node)
+            return;
+
+        const ULONGLONG now = GetTickCount64();
+        if (!node || now >= missCue.expires || Field<int>(node->actor, 0x21e8) <= 0)
+        {
+            missCue = {};
+            return;
+        }
+
+        const ULONGLONG remaining = missCue.expires - now;
+        const unsigned opacity = static_cast<unsigned>(std::min<ULONGLONG>(remaining * 255 / 180, 255));
+        float x, y;
+        const auto anchor = EnemyAnchor(node->actor);
+        if (ProjectAnchor(anchor, viewport, x, y))
+            overlay.DrawMiss(x, y, viewport, missCue.progress, missCue.offset, opacity);
     }
 
     struct HeldCue
@@ -564,7 +790,12 @@ namespace
         // The preceding native call stored the selected victim at +2254.
         // This call succeeds only when the attack dispatcher commits to Issen.
         if (result && player == At(Player))
-            HoldCue(Field<const BYTE*>(player, 0x2254));
+        {
+            const auto* target = Field<const BYTE*>(player, 0x2254);
+            if (missCue.actor == target)
+                missCue = {};
+            HoldCue(target);
+        }
         return result;
     }
 
@@ -648,6 +879,7 @@ namespace
         if (!player)
         {
             heldCues = {};
+            missCue = {};
             return;
         }
 
@@ -659,11 +891,14 @@ namespace
         const auto minimum = EffectiveMinimumFrames();
         const auto* target = GetIssenTarget(player);
         const EnemyNode* targetNode = nullptr;
+        const EnemyNode* missNode = nullptr;
         const auto mask = DifficultyMasks[level];
 
         Overlay overlay(device);
         for (auto* node = EnemyList(); node; node = node->next)
         {
+            if (node == missCue.node && node->actor == missCue.actor)
+                missNode = node;
             if (target && node->actor == target)
                 targetNode = node;
             else
@@ -672,12 +907,58 @@ namespace
         if (targetNode)
             DrawEnemy(overlay, viewport, targetNode, mask, minimum, true);
         DrawHeldCues(overlay, viewport);
+        DrawMissCue(overlay, viewport, missNode);
     }
 
     HRESULT WINAPI EndSceneWithCue(IDirect3DDevice9* device)
     {
         DrawCues(device);
         return device->EndScene();
+    }
+
+    std::array<BYTE, 5> MakeCall(const BYTE* site, std::uintptr_t target)
+    {
+        std::array<BYTE, 5> call{0xe8};
+        const auto distance = target - reinterpret_cast<std::uintptr_t>(site + call.size());
+        static_assert(sizeof(distance) == 4, "Build this ASI for x86.");
+        std::memcpy(call.data() + 1, &distance, sizeof(distance));
+        return call;
+    }
+
+    struct Patch
+    {
+        BYTE* address;
+        const BYTE* bytes;
+        std::size_t size;
+        DWORD protection;
+    };
+
+    void ApplyPatches(Patch* patches, std::size_t count)
+    {
+        std::size_t unlocked = 0;
+        for (; unlocked < count; ++unlocked)
+        {
+            auto& patch = patches[unlocked];
+            if (!VirtualProtect(patch.address, patch.size, PAGE_EXECUTE_READWRITE, &patch.protection))
+                break;
+        }
+
+        if (unlocked == count)
+        {
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                const auto& patch = patches[index];
+                std::memcpy(patch.address, patch.bytes, patch.size);
+                FlushInstructionCache(GetCurrentProcess(), patch.address, patch.size);
+            }
+        }
+
+        while (unlocked)
+        {
+            auto& patch = patches[--unlocked];
+            DWORD unused = 0;
+            VirtualProtect(patch.address, patch.size, patch.protection, &unused);
+        }
     }
 
     bool IsSupportedEdition(const BYTE* image)
@@ -706,6 +987,7 @@ extern "C" __declspec(dllexport) void InitializeASI()
     if (std::memcmp(site, OriginalEndScene, sizeof(OriginalEndScene)) ||
         std::memcmp(At(IssenSelector), SelectorThunk, sizeof(SelectorThunk)) ||
         std::memcmp(At(WorldToScreen), ProjectionThunk, sizeof(ProjectionThunk)) ||
+        std::memcmp(At(InputSelectCallSite), OriginalInputSelectCall, sizeof(OriginalInputSelectCall)) ||
         std::memcmp(At(CommitCallSite), OriginalCommitCall, sizeof(OriginalCommitCall)) ||
         std::memcmp(At(IssenCommit), CommitThunk, sizeof(CommitThunk)))
         return;
@@ -718,34 +1000,19 @@ extern "C" __declspec(dllexport) void InitializeASI()
     BYTE replacement[sizeof(OriginalEndScene)];
     std::memset(replacement, 0x90, sizeof(replacement));
     replacement[0] = 0x56; // push esi
-    replacement[1] = 0xe8; // call rel32
-    const auto relative = reinterpret_cast<std::uintptr_t>(&EndSceneWithCue) -
-                          reinterpret_cast<std::uintptr_t>(site + 6);
-    static_assert(sizeof(relative) == 4, "Build this ASI for x86.");
-    std::memcpy(replacement + 2, &relative, sizeof(relative));
+    const auto renderCall = MakeCall(site + 1, reinterpret_cast<std::uintptr_t>(&EndSceneWithCue));
+    std::memcpy(replacement + 1, renderCall.data(), renderCall.size());
 
-    // Replace only the call made by the direct-Issen input dispatcher.
+    BYTE* inputSite = At(InputSelectCallSite);
     BYTE* commitSite = At(CommitCallSite);
-    BYTE commitReplacement[sizeof(OriginalCommitCall)] = {0xe8};
-    const auto commitRelative = reinterpret_cast<std::uintptr_t>(&CommitWithCue) -
-                                reinterpret_cast<std::uintptr_t>(commitSite + sizeof(commitReplacement));
-    std::memcpy(commitReplacement + 1, &commitRelative, sizeof(commitRelative));
-
-    DWORD renderProtection = 0;
-    if (!VirtualProtect(site, sizeof(replacement), PAGE_EXECUTE_READWRITE, &renderProtection))
-        return;
-
-    DWORD commitProtection = 0;
-    DWORD unused = 0;
-    if (VirtualProtect(commitSite, sizeof(commitReplacement), PAGE_EXECUTE_READWRITE, &commitProtection))
-    {
-        std::memcpy(site, replacement, sizeof(replacement));
-        std::memcpy(commitSite, commitReplacement, sizeof(commitReplacement));
-        FlushInstructionCache(GetCurrentProcess(), site, sizeof(replacement));
-        FlushInstructionCache(GetCurrentProcess(), commitSite, sizeof(commitReplacement));
-        VirtualProtect(commitSite, sizeof(commitReplacement), commitProtection, &unused);
-    }
-    VirtualProtect(site, sizeof(replacement), renderProtection, &unused);
+    const auto inputCall = MakeCall(inputSite, reinterpret_cast<std::uintptr_t>(&SelectFromInput));
+    const auto commitCall = MakeCall(commitSite, reinterpret_cast<std::uintptr_t>(&CommitWithCue));
+    Patch patches[] = {
+        {site, replacement, sizeof(replacement), 0},
+        {inputSite, inputCall.data(), inputCall.size(), 0},
+        {commitSite, commitCall.data(), commitCall.size(), 0},
+    };
+    ApplyPatches(patches, ARRAYSIZE(patches));
 }
 
 BOOL WINAPI DllMain(HMODULE instance, DWORD reason, LPVOID)
